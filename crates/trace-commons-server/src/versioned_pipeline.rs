@@ -19,12 +19,12 @@ use tokio_postgres::Row;
 use trace_commons_gate_api::pipeline::{
     AdmissionDecision, AdmissionEvaluation, AdmissionEvidence, AdmissionInput, AdmissionPolicy,
     AtomicUnits, BUNDLE_MANIFEST_FORMAT_VERSION, BundleManifest, BundlePackage,
-    IndexMembershipDecision, InstrumentAward, InstrumentAwards, InstrumentSettlement, Microcredits,
-    PIPELINE_OUTCOME_SCHEMA_ID, PIPELINE_OUTCOME_SCHEMA_VERSION, Phase, PhaseResult, PolicyError,
-    PolicyRef, ReasonCode, ReviewDecision, ReviewEvaluation, ReviewEvidence, ReviewInput,
-    ReviewPolicy, ReviewRecommendation, SchemaRef, ScoreDecision, ScoreEvaluation, ScoreEvidence,
-    ScoreInput, ScorePolicy, SettleDecision, SettleEvaluation, SettleEvidence, SettleInput,
-    SettlePolicy,
+    HumanReviewAssessment, IndexMembershipDecision, InstrumentAward, InstrumentAwards,
+    InstrumentSettlement, Microcredits, PIPELINE_OUTCOME_SCHEMA_ID,
+    PIPELINE_OUTCOME_SCHEMA_VERSION, Phase, PhaseResult, PolicyError, PolicyRef, ReasonCode,
+    ReviewDecision, ReviewEvaluation, ReviewEvidence, ReviewInput, ReviewPolicy,
+    ReviewRecommendation, SchemaRef, ScoreDecision, ScoreEvaluation, ScoreEvidence, ScoreInput,
+    ScorePolicy, SettleDecision, SettleEvaluation, SettleEvidence, SettleInput, SettlePolicy,
 };
 use trace_commons_gate_api::{
     Embedder, IndexWriteError, PerplexityScorer, ReferenceEmbedder, ReferencePerplexityScorer,
@@ -359,6 +359,16 @@ pub struct PipelineLeaseClaim {
     pub lease_expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineReviewClaim {
+    #[serde(skip_serializing, default)]
+    pub tenant_id: String,
+    pub run_id: Uuid,
+    pub reviewer_principal_ref: String,
+    pub lease_token: Uuid,
+    pub lease_expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipelineReceiptResult {
     Created(PipelineRunRecord),
@@ -552,6 +562,45 @@ impl PgPipelineStore {
         Ok(package)
     }
 
+    pub async fn list_rebuildable_index_runs(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<PipelineRunRecord>, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let rows = tx
+            .query(
+                "SELECT p.*
+                   FROM pipeline_runs p
+                   JOIN trace_submissions s
+                     ON s.tenant_id = p.tenant_id
+                    AND s.submission_id = p.submission_id
+                   JOIN trace_derived_records d
+                     ON d.tenant_id = p.tenant_id
+                    AND d.derived_id = p.approved_revision_id
+                    AND d.status = 'current'
+                   LEFT JOIN trace_withdrawals w
+                     ON w.tenant_id = p.tenant_id
+                    AND w.submission_id = p.submission_id
+                  WHERE p.tenant_id = $1
+                    AND p.state = 'complete'
+                    AND p.index_membership = 'included'
+                    AND p.index_write_state = 'complete'
+                    AND p.index_command_ref IS NOT NULL
+                    AND p.index_command_hash IS NOT NULL
+                    AND s.status = 'accepted'
+                    AND s.revoked_at IS NULL
+                    AND s.purged_at IS NULL
+                    AND (s.expires_at IS NULL OR s.expires_at > NOW())
+                    AND w.submission_id IS NULL
+                  ORDER BY p.created_at, p.run_id",
+                &[&tenant_id],
+            )
+            .await?;
+        tx.commit().await?;
+        rows.iter().map(pipeline_run_from_row).collect()
+    }
+
     pub async fn policy_is_runnable(
         &self,
         tenant_id: &str,
@@ -571,6 +620,226 @@ impl PgPipelineStore {
             .unwrap_or(false);
         tx.commit().await?;
         Ok(runnable)
+    }
+
+    pub async fn claim_review(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+        reviewer_principal_ref: &str,
+        lease_duration: Duration,
+    ) -> Result<Option<PipelineReviewClaim>, DatabaseError> {
+        if !reviewer_principal_ref.starts_with("reviewer_sha256:")
+            || lease_duration <= Duration::zero()
+            || lease_duration > Duration::minutes(30)
+        {
+            return Err(DatabaseError::Constraint(
+                "invalid review claim".to_string(),
+            ));
+        }
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let lease_token = Uuid::new_v4();
+        let lease_milliseconds = lease_duration.num_milliseconds();
+        let row = tx
+            .query_opt(
+                "INSERT INTO pipeline_review_claims (
+                    tenant_id, run_id, reviewer_principal_ref, lease_token, lease_expires_at
+                 )
+                 SELECT p.tenant_id, p.run_id, $3, $4,
+                        NOW() + ($5::bigint * INTERVAL '1 millisecond')
+                 FROM pipeline_runs p
+                 WHERE p.tenant_id = $1 AND p.run_id = $2
+                   AND p.next_phase = 'review'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM trace_withdrawals w
+                        WHERE w.tenant_id = p.tenant_id
+                          AND w.submission_id = p.submission_id
+                   )
+                 ON CONFLICT (tenant_id, run_id) DO UPDATE
+                 SET reviewer_principal_ref = EXCLUDED.reviewer_principal_ref,
+                     lease_token = EXCLUDED.lease_token,
+                     lease_expires_at = EXCLUDED.lease_expires_at,
+                     claimed_at = NOW()
+                 WHERE pipeline_review_claims.lease_expires_at <= NOW()
+                    OR pipeline_review_claims.reviewer_principal_ref = $3
+                 RETURNING *",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &reviewer_principal_ref,
+                    &lease_token,
+                    &lease_milliseconds,
+                ],
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(row.map(|row| PipelineReviewClaim {
+            tenant_id: row.get("tenant_id"),
+            run_id: row.get("run_id"),
+            reviewer_principal_ref: row.get("reviewer_principal_ref"),
+            lease_token: row.get("lease_token"),
+            lease_expires_at: row.get("lease_expires_at"),
+        }))
+    }
+
+    pub async fn record_review_assessment(
+        &self,
+        claim: &PipelineReviewClaim,
+        recommendation: ReviewRecommendation,
+        reason: ReasonCode,
+        resolved_quarantine_reasons: Vec<ReasonCode>,
+    ) -> Result<HumanReviewAssessment, DatabaseError> {
+        let mut resolved = resolved_quarantine_reasons;
+        resolved.sort();
+        resolved.dedup();
+        let recommendation_label = match recommendation {
+            ReviewRecommendation::Approve => "approve",
+            ReviewRecommendation::Reject => "reject",
+        };
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, &claim.tenant_id).await?;
+        let row = tx
+            .query_opt(
+                "SELECT p.admission_reason
+                 FROM pipeline_review_claims c
+                 JOIN pipeline_runs p
+                   ON p.tenant_id = c.tenant_id AND p.run_id = c.run_id
+                 WHERE c.tenant_id = $1 AND c.run_id = $2
+                   AND c.lease_token = $3
+                   AND c.reviewer_principal_ref = $4
+                   AND c.lease_expires_at > NOW()
+                   AND p.next_phase = 'review'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM trace_withdrawals w
+                        WHERE w.tenant_id = p.tenant_id
+                          AND w.submission_id = p.submission_id
+                   )
+                 FOR UPDATE OF c, p",
+                &[
+                    &claim.tenant_id,
+                    &claim.run_id,
+                    &claim.lease_token,
+                    &claim.reviewer_principal_ref,
+                ],
+            )
+            .await?;
+        let Some(row) = row else {
+            return Err(DatabaseError::Constraint(
+                "review claim is stale or inoperable".to_string(),
+            ));
+        };
+        let admission_reason: Option<String> = row.get("admission_reason");
+        if recommendation == ReviewRecommendation::Approve {
+            let resolved_admission_reason = admission_reason
+                .as_ref()
+                .is_some_and(|reason| resolved.iter().any(|item| item.as_str() == reason));
+            if !resolved_admission_reason && !(admission_reason.is_none() && !resolved.is_empty()) {
+                return Err(DatabaseError::Constraint(
+                    "quarantine reason is unresolved".to_string(),
+                ));
+            }
+        }
+        let resolved_json = serde_json::to_value(&resolved).map_err(|_| {
+            DatabaseError::Serialization("review assessment encode failed".to_string())
+        })?;
+        let evidence_hash = sha256_prefixed(
+            serde_json::to_vec(&serde_json::json!({
+                "schema": "trace_commons.pipeline_review_assessment.v1",
+                "run_id": claim.run_id,
+                "recommendation": recommendation_label,
+                "reason": reason.as_str(),
+                "resolved_quarantine_reasons": resolved,
+            }))
+            .map_err(|_| {
+                DatabaseError::Serialization("review assessment encode failed".to_string())
+            })?
+            .as_slice(),
+        );
+        let assessment_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!(
+                "tracecommons:pipeline-review-assessment:{}:{evidence_hash}",
+                claim.run_id
+            )
+            .as_bytes(),
+        );
+        tx.execute(
+            "INSERT INTO pipeline_review_assessments (
+                tenant_id, assessment_id, run_id, reviewer_principal_ref,
+                recommendation, reason_code, resolved_quarantine_reasons, evidence_hash
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+            &[
+                &claim.tenant_id,
+                &assessment_id,
+                &claim.run_id,
+                &claim.reviewer_principal_ref,
+                &recommendation_label,
+                &reason.as_str(),
+                &resolved_json,
+                &evidence_hash,
+            ],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM pipeline_review_claims
+             WHERE tenant_id = $1 AND run_id = $2 AND lease_token = $3",
+            &[&claim.tenant_id, &claim.run_id, &claim.lease_token],
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(HumanReviewAssessment {
+            assessment_id,
+            recommendation,
+            reason,
+            resolved_quarantine_reasons: resolved,
+            evidence_hash,
+        })
+    }
+
+    pub async fn load_review_assessment(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+    ) -> Result<Option<HumanReviewAssessment>, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let row = tx
+            .query_opt(
+                "SELECT assessment_id, recommendation, reason_code,
+                        resolved_quarantine_reasons, evidence_hash
+                 FROM pipeline_review_assessments
+                 WHERE tenant_id = $1 AND run_id = $2",
+                &[&tenant_id, &run_id],
+            )
+            .await?;
+        tx.commit().await?;
+        row.map(|row| {
+            let recommendation = match row.get::<_, String>("recommendation").as_str() {
+                "approve" => Ok(ReviewRecommendation::Approve),
+                "reject" => Ok(ReviewRecommendation::Reject),
+                _ => Err(DatabaseError::Serialization(
+                    "unknown review recommendation".to_string(),
+                )),
+            }?;
+            let reason = ReasonCode::new(row.get::<_, String>("reason_code")).map_err(|_| {
+                DatabaseError::Serialization("invalid review assessment reason".to_string())
+            })?;
+            let resolved_quarantine_reasons = serde_json::from_value(
+                row.get::<_, serde_json::Value>("resolved_quarantine_reasons"),
+            )
+            .map_err(|_| {
+                DatabaseError::Serialization("invalid resolved quarantine reasons".to_string())
+            })?;
+            Ok(HumanReviewAssessment {
+                assessment_id: row.get("assessment_id"),
+                recommendation,
+                reason,
+                resolved_quarantine_reasons,
+                evidence_hash: row.get("evidence_hash"),
+            })
+        })
+        .transpose()
     }
 
     async fn stage_receipt_artifact(
@@ -1387,34 +1656,41 @@ impl PgPipelineStore {
             return Err(stale_lease_error());
         }
         if outcome.phase == Phase::Review {
-            let revision_id = approved_revision_id.ok_or_else(|| {
-                DatabaseError::Constraint("approved Review requires a revision".to_string())
-            })?;
-            tx.execute(
-                "INSERT INTO trace_derived_records (
-                    tenant_id, derived_id, submission_id, trace_id, status,
-                    worker_kind, worker_version, input_object_ref_id, input_hash,
-                    output_object_ref_id, summary_model
-                 ) VALUES ($1,$2,$3,$4,'current','summary',$5,$6,$7,$6,$5)
-                 ON CONFLICT (tenant_id, derived_id) DO NOTHING",
-                &[
-                    &run.tenant_id,
-                    &revision_id,
-                    &run.submission_id,
-                    &run.trace_id,
-                    &MINIMAL_PIPELINE_BUNDLE_LABEL,
-                    &run.source_object_ref_id,
-                    &run.request_content_hash,
-                ],
-            )
-            .await?;
-            tx.execute(
-                "UPDATE trace_submissions
-                 SET status = 'accepted', reviewed_at = NOW(), updated_at = NOW()
-                 WHERE tenant_id = $1 AND submission_id = $2",
-                &[&run.tenant_id, &run.submission_id],
-            )
-            .await?;
+            if let Some(revision_id) = approved_revision_id {
+                tx.execute(
+                    "INSERT INTO trace_derived_records (
+                        tenant_id, derived_id, submission_id, trace_id, status,
+                        worker_kind, worker_version, input_object_ref_id, input_hash,
+                        output_object_ref_id, summary_model
+                     ) VALUES ($1,$2,$3,$4,'current','summary',$5,$6,$7,$6,$5)
+                     ON CONFLICT (tenant_id, derived_id) DO NOTHING",
+                    &[
+                        &run.tenant_id,
+                        &revision_id,
+                        &run.submission_id,
+                        &run.trace_id,
+                        &MINIMAL_PIPELINE_BUNDLE_LABEL,
+                        &run.source_object_ref_id,
+                        &run.request_content_hash,
+                    ],
+                )
+                .await?;
+                tx.execute(
+                    "UPDATE trace_submissions
+                     SET status = 'accepted', reviewed_at = NOW(), updated_at = NOW()
+                     WHERE tenant_id = $1 AND submission_id = $2",
+                    &[&run.tenant_id, &run.submission_id],
+                )
+                .await?;
+            } else {
+                tx.execute(
+                    "UPDATE trace_submissions
+                     SET status = 'rejected', reviewed_at = NOW(), updated_at = NOW()
+                     WHERE tenant_id = $1 AND submission_id = $2",
+                    &[&run.tenant_id, &run.submission_id],
+                )
+                .await?;
+            }
         }
         insert_outcome(
             &tx,
@@ -2827,20 +3103,40 @@ pub struct PipelineInspection {
     pub outcomes: Vec<PhaseOutcomeRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineIndexRebuildReport {
+    pub command_count: usize,
+    pub entry_count: usize,
+    pub unchanged_entry_count: usize,
+    pub command_set_hash: String,
+}
+
 pub trait IdentifiedPerplexityScorer: PerplexityScorer {
     fn dependency_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
 }
 
 pub trait IdentifiedEmbedder: Embedder {
     fn dependency_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
 }
 
 pub trait IdentifiedIndexReader: VectorIndexReader {
     fn dependency_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
 }
 
 pub trait IdentifiedIndexWriter: VectorIndexWriter {
     fn dependency_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
 
     fn invalidate_revision(
         &self,
@@ -2895,6 +3191,18 @@ pub struct PipelineDependencyIdentity {
     pub index_writer: String,
     pub settlement_adapters: BTreeMap<String, String>,
     pub payout_adapter: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineDependencyQualification {
+    pub authority: bool,
+    pub privacy: bool,
+    pub scorer: bool,
+    pub embedder: bool,
+    pub index_reader: bool,
+    pub index_writer: bool,
+    pub settlement_adapters: BTreeMap<String, bool>,
+    pub payout_adapter: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2979,7 +3287,31 @@ impl PipelineServiceBuilder {
         backend: Arc<PgBackend>,
         artifact_store: Arc<dyn TraceArtifactStore>,
     ) -> anyhow::Result<Self> {
+        Self::test_only_package(backend, artifact_store, None, false)
+    }
+
+    #[doc(hidden)]
+    pub fn test_only_package(
+        backend: Arc<PgBackend>,
+        artifact_store: Arc<dyn TraceArtifactStore>,
+        package: Option<BundlePackage>,
+        compatibility: bool,
+    ) -> anyhow::Result<Self> {
         let index = IsolatedPipelineIndex::new();
+        let compatibility_runtime = CompatibilityScoreRuntime::reference(index.clone());
+        let default_bundle = match package {
+            Some(package) => MinimalPolicyBundle::from_package_with_runtime(
+                package,
+                Some(&compatibility_runtime),
+            )?,
+            None if compatibility => {
+                MinimalPolicyBundle::build_compatibility(&compatibility_runtime)?
+            }
+            None => MinimalPolicyBundle::build()?,
+        };
+        let uses_compatibility = parse_bundle_config(&default_bundle.package)?
+            .compatibility
+            .is_some();
         let near = Arc::new(RecordingNearAdapter::new());
         let trace_credit = RecordingSettlementAdapter::new(
             trace_commons_gate_api::pipeline::InstrumentId::trace_credit(),
@@ -2989,7 +3321,7 @@ impl PipelineServiceBuilder {
         Ok(Self {
             backend,
             artifact_store,
-            default_bundle: MinimalPolicyBundle::build()?,
+            default_bundle,
             scorer: Arc::new(ReferencePerplexityScorer::new()),
             embedder: Arc::new(ReferenceEmbedder::new()),
             index_reader: index.clone(),
@@ -3018,7 +3350,7 @@ impl PipelineServiceBuilder {
                 enabled: false,
                 require_confirmation_evidence: true,
             },
-            compatibility_runtime: None,
+            compatibility_runtime: uses_compatibility.then_some(compatibility_runtime),
             fail_phase: None,
             crash_point: None,
             test_index: Some(index),
@@ -3137,8 +3469,54 @@ impl PipelineService {
             .build()
     }
 
+    #[doc(hidden)]
+    pub fn new_local_test(
+        backend: Arc<PgBackend>,
+        artifact_store: Arc<dyn TraceArtifactStore>,
+        package: Option<BundlePackage>,
+        compatibility: bool,
+        fail_phase: Option<Phase>,
+    ) -> anyhow::Result<Self> {
+        PipelineServiceBuilder::test_only_package(backend, artifact_store, package, compatibility)?
+            .with_test_faults(fail_phase, None)
+            .build()
+    }
+
     pub fn bundle_id(&self) -> &str {
         &self.default_bundle.package.bundle_id
+    }
+
+    pub async fn claim_review(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+        reviewer_principal_ref: &str,
+        lease_duration: Duration,
+    ) -> anyhow::Result<Option<PipelineReviewClaim>> {
+        Ok(self
+            .store
+            .claim_review(tenant_id, run_id, reviewer_principal_ref, lease_duration)
+            .await?)
+    }
+
+    pub async fn record_review_assessment(
+        &self,
+        claim: &PipelineReviewClaim,
+        recommendation: ReviewRecommendation,
+        reason: ReasonCode,
+        resolved_quarantine_reasons: Vec<ReasonCode>,
+    ) -> anyhow::Result<HumanReviewAssessment> {
+        Ok(self
+            .store
+            .record_review_assessment(claim, recommendation, reason, resolved_quarantine_reasons)
+            .await?)
+    }
+
+    pub fn default_package_hash(&self) -> anyhow::Result<String> {
+        self.default_bundle
+            .package
+            .package_hash()
+            .map_err(anyhow::Error::from)
     }
 
     pub fn index(&self) -> Arc<IsolatedPipelineIndex> {
@@ -3171,6 +3549,19 @@ impl PipelineService {
         }
     }
 
+    pub fn dependency_qualification(&self) -> PipelineDependencyQualification {
+        PipelineDependencyQualification {
+            authority: self.authority.production_qualified(),
+            privacy: self.privacy.production_qualified(),
+            scorer: self.scorer.production_qualified(),
+            embedder: self.embedder.production_qualified(),
+            index_reader: self.index_reader.production_qualified(),
+            index_writer: self.index_writer.production_qualified(),
+            settlement_adapters: self.settlement_adapters.production_qualifications(),
+            payout_adapter: self.payout_adapter.production_qualified(),
+        }
+    }
+
     pub fn score_evaluations(&self) -> usize {
         self.score_evaluations.load(Ordering::SeqCst)
     }
@@ -3195,6 +3586,46 @@ impl PipelineService {
 
     pub async fn active_bundle_id(&self, tenant_id: &str) -> anyhow::Result<Option<String>> {
         Ok(self.store.active_bundle_id(tenant_id).await?)
+    }
+
+    pub async fn rebuild_index_from_authoritative_commands(
+        &self,
+        tenant_id: &str,
+        writer: Arc<dyn VectorIndexWriter>,
+    ) -> anyhow::Result<PipelineIndexRebuildReport> {
+        let runs = self.store.list_rebuildable_index_runs(tenant_id).await?;
+        let mut command_hashes = Vec::with_capacity(runs.len());
+        let mut entry_count = 0usize;
+        let mut unchanged_entry_count = 0usize;
+        for run in runs {
+            let command = self.load_sealed_command(&run).await?;
+            let expected_hash = run
+                .index_command_hash
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("sealed command hash is missing"))?;
+            anyhow::ensure!(
+                command.command_hash()? == expected_hash,
+                "sealed command hash mismatch"
+            );
+            command_hashes.push(expected_hash.to_string());
+            for (key, embedding, content_hash) in command.entry_keys(tenant_id) {
+                match writer.upsert(&key, &embedding, &content_hash) {
+                    Ok(trace_commons_gate_api::IndexUpsertResult::Inserted) => {}
+                    Ok(trace_commons_gate_api::IndexUpsertResult::Unchanged) => {
+                        unchanged_entry_count += 1;
+                    }
+                    Err(error) => return Err(anyhow::anyhow!("index rebuild failed: {error}")),
+                }
+                entry_count += 1;
+            }
+        }
+        let command_set_hash = sha256_prefixed(serde_json::to_vec(&command_hashes)?.as_slice());
+        Ok(PipelineIndexRebuildReport {
+            command_count: command_hashes.len(),
+            entry_count,
+            unchanged_entry_count,
+            command_set_hash,
+        })
     }
 
     pub async fn list_cleanup_orphans(
@@ -3672,6 +4103,10 @@ impl PipelineService {
                     })?;
                 let source_artifact = self.load_source_bytes(run).await?;
                 let source_content_hash = sha256_prefixed(&source_artifact);
+                let human_assessment = self
+                    .store
+                    .load_review_assessment(&run.tenant_id, run.run_id)
+                    .await?;
                 let result = bundle
                     .review
                     .execute(&ReviewInput {
@@ -3680,7 +4115,7 @@ impl PipelineService {
                         source_content_hash,
                         source_artifact,
                         admission,
-                        human_assessment: None,
+                        human_assessment,
                     })
                     .await?;
                 self.inject_crash(PipelineCrashPoint::AfterReviewWork)?;

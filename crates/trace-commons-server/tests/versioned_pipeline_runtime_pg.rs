@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use base64::Engine;
 use chrono::Utc;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use secrecy::SecretString;
 use trace_commons_gate_api::pipeline::{AdmissionDecision, InstrumentId, Phase};
 use trace_commons_gate_api::{ReferenceEmbedder, ReferencePerplexityScorer};
@@ -30,7 +32,7 @@ use trace_commons_server::versioned_pipeline_authority::{
     ClassifierRedactorPipelinePrivacyBoundary, StaticPipelineAuthorityProvider,
 };
 use trace_commons_server::versioned_pipeline_compat::{
-    COMPATIBILITY_SCORE_IMPLEMENTATION, CompatibilityScoreRuntime,
+    COMPATIBILITY_SCORE_IMPLEMENTATION, CompatibilityBundleConfig, CompatibilityScoreRuntime,
 };
 use trace_commons_server::versioned_pipeline_credit::{
     RecordingNearAdapter, RecordingSettlementAdapter, SettlementAdapterRegistry,
@@ -41,6 +43,12 @@ use trace_commons_server::versioned_pipeline_index::{
 use trace_commons_server::versioned_pipeline_product::{
     PIPELINE_STATUS_BATCH_MAX, PipelineCreditStatus, PipelineProcessingStatus,
     PipelineProductStore, sha256_prefixed,
+};
+use trace_commons_server::versioned_pipeline_qualification::{
+    BundlePackageSignature, BundlePackageTrustStore, BundleQualificationMetadata,
+    PACKAGE_DEVELOPMENT_DEPENDENCY_LABEL, PACKAGE_SIGNATURE_ALGORITHM, PipelineQualificationStore,
+    ProductionAdapterKind, ProductionDependencyProfile, ProductionInfrastructureProfile,
+    SignedBundlePackage, TrustedBundleKey,
 };
 use uuid::Uuid;
 
@@ -58,9 +66,26 @@ async fn backend(pool_size: usize) -> Option<Arc<PgBackend>> {
         }
     };
     let _guard = MIGRATION_LOCK.lock().await;
-    if let Err(error) = backend.run_migrations().await {
-        eprintln!("skipping: migrations failed ({error})");
-        return None;
+    if std::env::var_os("TRACE_COMMONS_PIPELINE_SKIP_TEST_MIGRATIONS").is_none() {
+        if let Err(error) = backend.run_migrations().await {
+            eprintln!("skipping: migrations failed ({error})");
+            return None;
+        }
+    }
+    if std::env::var_os("TRACE_COMMONS_PIPELINE_REQUIRE_NOBYPASSRLS").is_some() {
+        let client = backend.trace_pool_for_test().get().await.ok()?;
+        let row = client
+            .query_one(
+                "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user",
+                &[],
+            )
+            .await
+            .ok()?;
+        assert!(!row.get::<_, bool>("rolsuper"), "runtime role is superuser");
+        assert!(
+            !row.get::<_, bool>("rolbypassrls"),
+            "runtime role bypasses RLS"
+        );
     }
     Some(backend)
 }
@@ -1106,5 +1131,232 @@ async fn durable_withdrawal_reports_index_propagation_failures_without_becoming_
     assert_eq!(
         replay.index_invalidation,
         PipelineWithdrawalFollowUpState::Failed
+    );
+}
+
+#[tokio::test]
+async fn index_rebuild_uses_sealed_commands_without_new_credit_or_outcomes() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let tenant = format!("pipeline-index-rebuild-{}", Uuid::new_v4());
+    let near = Arc::new(RecordingNearAdapter::new());
+    let trace_credit = RecordingSettlementAdapter::new(
+        InstrumentId::trace_credit(),
+        "recording_trace_credit_test_only",
+        "none",
+    );
+    let service = production_service(
+        backend,
+        artifact_store(&root),
+        MinimalPolicyBundle::build_operations(100, true).unwrap(),
+        vec![trace_credit],
+        BTreeMap::from([(InstrumentId::trace_credit().as_str().to_string(), 1_000)]),
+        near,
+        false,
+        None,
+    );
+    let PipelineReceiptResult::Created(run) = service
+        .submit(
+            &tenant,
+            "principal_sha256:index_rebuild",
+            "index-rebuild",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("index rebuild fixture must create a run");
+    };
+    finish_run(&service, &tenant, run.run_id).await;
+    let before = service.inspect(&tenant, run.run_id).await.unwrap().unwrap();
+
+    let rebuilt = IsolatedPipelineIndex::new();
+    let first = service
+        .rebuild_index_from_authoritative_commands(&tenant, rebuilt.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.command_count, 1);
+    assert!(first.entry_count > 0);
+    assert_eq!(first.unchanged_entry_count, 0);
+    let second = service
+        .rebuild_index_from_authoritative_commands(&tenant, rebuilt)
+        .await
+        .unwrap();
+    assert_eq!(second.command_set_hash, first.command_set_hash);
+    assert_eq!(second.unchanged_entry_count, second.entry_count);
+
+    let after = service.inspect(&tenant, run.run_id).await.unwrap().unwrap();
+    assert_eq!(after.outcomes, before.outcomes);
+    assert_eq!(after.run, before.run);
+}
+
+#[tokio::test]
+async fn qualification_operational_summary_and_traceability_are_hash_only() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let tenant = format!("pipeline-operations-{}", Uuid::new_v4());
+    let service =
+        PipelineService::new_test_only(backend.clone(), artifact_store(&root), None).unwrap();
+    let secret = "private_qualification_value_must_not_appear";
+    let PipelineReceiptResult::Created(run) = service
+        .submit(
+            &tenant,
+            "principal_sha256:operations",
+            "operations",
+            &envelope_bytes_with_text(Uuid::new_v4(), secret).await,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("operations fixture must create a run");
+    };
+    finish_run(&service, &tenant, run.run_id).await;
+
+    let product = PipelineProductStore::new(backend);
+    let summary = product.operational_summary(&tenant).await.unwrap();
+    assert!(summary.tenant_isolation_control_passed);
+    assert!(summary.audit_immutability_control_passed);
+    let trace = product
+        .forensic_trace(&tenant, run.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(trace.phases.len(), 4);
+    assert!(trace.phases.iter().all(|phase| {
+        phase.decision_hash.starts_with("sha256:")
+            && phase.evidence_hash.starts_with("sha256:")
+            && phase.evaluation_hash.starts_with("sha256:")
+    }));
+    assert!(
+        !serde_json::to_string(&(summary, trace))
+            .unwrap()
+            .contains(secret)
+    );
+}
+
+#[tokio::test]
+async fn signed_package_qualification_rejects_nonproduction_candidate() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let index = IsolatedPipelineIndex::new();
+    let runtime = CompatibilityScoreRuntime::reference(index.clone());
+    let mut config = CompatibilityBundleConfig::local_reference();
+    config.scorer_model_id = "production-scorer-v1".to_string();
+    config.embedder_model_id = "production-embedder-v1".to_string();
+    config.projection_id = "production-projection-v1".to_string();
+    config.index_id = "production-index-v1".to_string();
+    let bundle = MinimalPolicyBundle::build_compatibility_candidate(&runtime, config).unwrap();
+    let package = bundle.package.clone();
+    let near = Arc::new(RecordingNearAdapter::new());
+    let adapter = RecordingSettlementAdapter::new(
+        InstrumentId::trace_credit(),
+        "production-settlement-v1",
+        "none",
+    );
+    let service = PipelineServiceBuilder::production(
+        backend.clone(),
+        artifact_store(&root),
+        bundle,
+        Arc::new(ReferencePerplexityScorer::new()),
+        Arc::new(ReferenceEmbedder::new()),
+        index.clone(),
+        index,
+        SettlementAdapterRegistry::new(vec![adapter]).unwrap(),
+        near,
+        Arc::new(StaticPipelineAuthorityProvider::new(
+            BTreeMap::new(),
+            "production-authority-v1",
+        )),
+        Arc::new(
+            ClassifierRedactorPipelinePrivacyBoundary::new(
+                Arc::new(NoopPrivacyFilterAdapter),
+                PiiClassifyPolicy::AllEvents,
+                "production-privacy-v1",
+            )
+            .unwrap(),
+        ),
+        PipelineCaps {
+            per_instrument_atomic_units: BTreeMap::from([(
+                InstrumentId::trace_credit().as_str().to_string(),
+                u64::MAX,
+            )]),
+        },
+        PipelinePayoutConfig {
+            enabled: false,
+            require_confirmation_evidence: true,
+        },
+    )
+    .with_compatibility_runtime(runtime)
+    .build()
+    .unwrap();
+    let profile = ProductionDependencyProfile::from_runtime(
+        &service,
+        ProductionInfrastructureProfile {
+            authoritative_metadata: ProductionAdapterKind::Production,
+            artifact_store: ProductionAdapterKind::Production,
+            key_wrapper: ProductionAdapterKind::Production,
+            authentication: ProductionAdapterKind::Production,
+            plaintext_fallback: false,
+            best_effort_database_mirror: false,
+            static_bearer_authentication: false,
+            hs256_bridge_authentication: false,
+            unversioned_policy_dependencies: false,
+            live_external_payout_enabled: false,
+        },
+    );
+    assert!(
+        profile
+            .blockers()
+            .contains(&"runtime_scorer_not_production".to_string())
+    );
+
+    let random = ring::rand::SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&random).unwrap();
+    let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+    let package_hash = package.package_hash().unwrap();
+    let signed = SignedBundlePackage {
+        package,
+        signature: BundlePackageSignature {
+            algorithm: PACKAGE_SIGNATURE_ALGORITHM.to_string(),
+            key_id: "qualification-release-key".to_string(),
+            package_hash: package_hash.clone(),
+            signature_base64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(key_pair.sign(package_hash.as_bytes()).as_ref()),
+        },
+    };
+    let trust = BundlePackageTrustStore::new([TrustedBundleKey {
+        key_id: signed.signature.key_id.clone(),
+        public_key_base64url: base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(key_pair.public_key().as_ref()),
+    }])
+    .unwrap();
+    let metadata = BundleQualificationMetadata {
+        corpus_digest: sha256_prefixed(b"qualification-corpus"),
+        input_digest: sha256_prefixed(b"qualification-input"),
+        configuration_digest: sha256_prefixed(b"qualification-configuration"),
+        code_revision_hash: sha256_prefixed(b"qualification-code"),
+        runtime_dependency_digest: profile.runtime_identity_digest().unwrap(),
+        evidence_hash: sha256_prefixed(b"qualification-evidence"),
+    };
+    let error = PipelineQualificationStore::new(backend)
+        .qualify_bundle(
+            &format!("pipeline-package-{}", Uuid::new_v4()),
+            &signed,
+            &trust,
+            &metadata,
+            &profile,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(PACKAGE_DEVELOPMENT_DEPENDENCY_LABEL)
     );
 }

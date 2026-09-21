@@ -40,7 +40,7 @@ The command writes:
 
 - `.local/lab/report.json`: the latest graded report.
 - `.local/lab/report.md`: the readable report.
-- `.local/pipeline-lab-catalog-v1.json`: the catalog.
+- `.local/pipeline-lab-catalog.json`: the catalog.
 - `.local/lab-records/`: immutable copies of reports, signed packages, public
   keys, and qualification evidence, named by their file digests.
 
@@ -71,11 +71,10 @@ trace IDs, and submission IDs must be unique. Reports are rejected as corpus
 inputs. In particular, `.local/pipeline-restore-corpus.json` is an output
 report from the restore drill.
 
-The git corpus stays the fast CI corpus. The lab does not download Hugging
-Face data. A later HF JSONL adapter can emit this same input schema.
-`trace-commons-pilot-bootstrap` downloads JSONL and submits to ingest; it is
-not the pipeline lab. `trace-commons-gate-calibrate` calibrates the old gate;
-it does not calibrate these four policies.
+The git corpus stays the fast CI corpus. The operator HF workflow uses the
+same JSONL translators as `trace-commons-pilot-bootstrap`. It exports pinned
+bootstrap and holdout corpora before it calls this lab. Ordinary CI does not
+download Hugging Face data.
 
 ## Isolation and privacy
 
@@ -209,7 +208,7 @@ bash scripts/operator/lab/run.sh qualify
 ```
 
 This command wraps the existing pipeline qualification script. It runs package
-and lab checks, the full `versioned_pipeline_pg` integration suite, the
+and lab checks, the full `versioned_pipeline_runtime_pg` integration suite, the
 compatibility corpus, and the backup/restore drill. That integration suite
 includes activation coverage. It writes the existing qualification reports and updates the same
 catalog through the standalone `catalog` command.
@@ -218,7 +217,7 @@ The old minimal, compatibility, and product corpus scripts remain supported.
 They call the shared lab workflow and retain their report filenames. Their
 filename version numbers do not select the report schema.
 
-`versioned_pipeline_pg` remains the integration suite for schema contracts,
+`versioned_pipeline_runtime_pg` remains the integration suite for schema contracts,
 transactions, crashes, fenced leases, RLS, and activation. The lab supplies
 corpus, qualification, and package evidence. It does not replace those tests.
 For lab file-handling tests only, run:
@@ -230,9 +229,8 @@ RUSTFLAGS='-D warnings' cargo test -p trace-commons-server --bin trace-commons-p
 
 ## Deferred work
 
-There is no calibration command or automatic bootstrap/holdout split. A later
-calibration command must keep bootstrap and holdout data separate, record both
-input digests and fixed orders, evaluate the holdout, and emit changed Score
-or Admission configuration. Changed configuration must produce a new
-`bundle_id`, package, and report. Moving the old scripts does not implement
-this behavior. Multi-party valuation (`SCR-005`) remains out of scope.
+There is no calibration command. The HF qualification workflow keeps bootstrap
+and holdout inputs separate, but it does not change Score or Admission
+configuration. A future calibration command must emit a new `bundle_id`,
+package, and report when it changes configuration. Multi-party valuation
+(`SCR-005`) remains out of scope.

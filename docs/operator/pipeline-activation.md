@@ -26,7 +26,7 @@ Set `TRACE_COMMONS_PG_TEST_DATABASE_URL` to a PostgreSQL test database.
 Then run this command:
 
 ```bash
-cargo test -p trace-commons-server --test versioned_pipeline_pg pipeline_activation
+cargo test -p trace-commons-server --test versioned_pipeline_runtime_pg pipeline_activation
 ```
 
 The tests cover mixed legacy and pipeline records, exact replay of a

@@ -43,7 +43,7 @@ Set `TRACE_COMMONS_PG_TEST_DATABASE_URL` to a PostgreSQL test database. Then
 run this command:
 
 ```bash
-cargo test -p trace-commons-server --test versioned_pipeline_pg
+cargo test -p trace-commons-server --test versioned_pipeline_runtime_pg
 ```
 
 The test covers receipt races, concurrent workers, stale leases, retry

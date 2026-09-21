@@ -1,6 +1,6 @@
 # Package and promotion qualification
 
-This specification defines package trust and Phase 7 promotion evidence.
+This specification defines package trust and pipeline promotion evidence.
 
 ## Package signature
 
@@ -34,7 +34,9 @@ a current passing promotion decision. It also requires the deployed code
 revision and the current production dependency profile.
 
 The code revision must match the qualified revision. All production
-dependencies must remain available. The operation selects only a qualified
+dependencies must remain available. The stored runtime dependency digest must
+match identities derived from the adapters held by the running service. Caller
+labels cannot replace this derivation. The operation selects only a qualified
 package with four runnable policies.
 
 Foreign keys prevent package removal while a run, active selection, or
@@ -67,6 +69,8 @@ and evidence hash. The result can also contain safe blocker labels.
 
 Promotion requires current passing evidence for all drills in `OPS-004`.
 Missing, failed, future-dated, or stale evidence blocks promotion.
+Pinned Hugging Face corpus evidence is one required drill. It expires after
+seven days. The checked-in corpus remains the ordinary CI input.
 
 Use a promotion decision within 15 minutes. The activation operation rejects
 an older decision.

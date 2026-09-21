@@ -887,6 +887,102 @@ jobs:
       # runs exactly when a save is about to happen.
       - uses: ./.github/actions/trim-cargo-cache
 
+  pipeline-deployment-inventory:
+    name: pipeline deployment inventory
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Classify deployment interfaces
+        run: python3 scripts/operator/pipeline-deployment-inventory.py --check
+
+  pipeline-postgres-qualification:
+    name: pipeline PostgreSQL qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-pipeline-qualification-postgres-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pipeline-qualification-postgres-
+      - name: Run versioned pipeline PostgreSQL suite
+        run: scripts/operator/run-pipeline-postgres-qualification.sh
+      - uses: ./.github/actions/trim-cargo-cache
+
+  pipeline-adapter-qualification:
+    name: pipeline adapter qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-pipeline-qualification-adapters-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pipeline-qualification-adapters-
+      - name: Run adapter idempotency and capability suites
+        run: |
+          scripts/operator/run-cargo-test-filter.sh versioned_pipeline_index -p trace-commons-server --lib
+          scripts/operator/run-cargo-test-filter.sh versioned_pipeline_credit -p trace-commons-server --lib
+          scripts/operator/run-cargo-test-filter.sh versioned_pipeline_compat -p trace-commons-server --lib
+      - uses: ./.github/actions/trim-cargo-cache
+
+  pipeline-corpus-qualification:
+    name: pipeline corpus qualification
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-pipeline-qualification-corpus-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pipeline-qualification-corpus-
+      - name: Run compatibility corpus through HTTP and workers
+        run: scripts/operator/run-compatibility-pipeline-corpus.sh
+      - uses: ./.github/actions/trim-cargo-cache
+
+  pipeline-qualification:
+    name: pipeline qualification and restore
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-pipeline-qualification-restore-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pipeline-qualification-restore-
+      - name: Run pipeline qualification
+        run: bash scripts/operator/run-pipeline-qualification.sh
+      - uses: ./.github/actions/trim-cargo-cache
+
   pilot-bootstrap-smoke:
     name: pilot-bootstrap smoke
     runs-on: ubuntu-latest

@@ -21,6 +21,9 @@ pub const PIPELINE_PRIVACY_CLASSIFICATION_FAILED_LABEL: &str = "privacy_classifi
 pub trait PipelineAuthorityProvider: Send + Sync {
     fn authority_for_tenant(&self, tenant_id: &str) -> Option<SubmissionAuthority>;
     fn dependency_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +77,9 @@ pub trait PipelinePrivacyBoundary: Send + Sync {
 
     fn dependency_identity(&self) -> &str;
     fn is_production_compatible(&self) -> bool;
+    fn production_qualified(&self) -> bool {
+        false
+    }
 }
 
 pub struct DeterministicPipelinePrivacyBoundary;

@@ -197,6 +197,8 @@ Every runbook in this directory, with a one-line description.
 - [`./pilot-contributor-onboarding.md`](./pilot-contributor-onboarding.md) —
   contributor-facing setup flow for invite code, workload JWT, Ironclaw
   opt-in, profile handle registration, and leaderboard expectations.
+- [`./pipeline-qualification.md`](./pipeline-qualification.md) — package trust, deployment
+  inventory, restore evidence, and promotion-gate procedure.
 - [`./smoke-test.md`](./smoke-test.md) — post-deploy validation checklist
   that exercises every required drill plus a fixture gate evaluation.
 - [`./tracecommons-ai-community-site.md`](./tracecommons-ai-community-site.md) —

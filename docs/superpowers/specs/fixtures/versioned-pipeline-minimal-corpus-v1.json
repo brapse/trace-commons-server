@@ -24,7 +24,9 @@
       "created_at": "2026-09-11T12:02:00Z",
       "input": "Review this medium-risk redacted fixture.",
       "secret_probe": "medium-risk-secret-not-present",
+      "server_privacy_probe": "qualification.approved@example.com",
       "privacy_risk": "medium",
+      "expected_privacy_state": "medium",
       "expected_admission_decision": "quarantine",
       "expected_outcome_count": 4,
       "review_recommendation": "approve"
@@ -36,9 +38,13 @@
       "created_at": "2026-09-11T12:03:00Z",
       "input": "Reject this unresolved medium-risk redacted fixture.",
       "secret_probe": "review-rejection-secret-not-present",
+      "server_privacy_probe": "qualification.rejected@example.com",
       "privacy_risk": "medium",
+      "expected_privacy_state": "medium",
       "expected_admission_decision": "quarantine",
       "expected_outcome_count": 2,
+      "expected_scoring_state": "missing",
+      "expected_settlement_state": "incomplete",
       "review_recommendation": "reject"
     },
     {
@@ -49,8 +55,11 @@
       "input": "Reject this high-risk redacted fixture during Admission.",
       "secret_probe": "high-risk-secret-not-present",
       "privacy_risk": "high",
+      "expected_privacy_state": "high",
       "expected_admission_decision": "reject",
-      "expected_outcome_count": 1
+      "expected_outcome_count": 1,
+      "expected_scoring_state": "missing",
+      "expected_settlement_state": "incomplete"
     }
   ]
 }

@@ -31,6 +31,9 @@ pub struct SettlementRequest {
 pub trait SettlementAdapter: Send + Sync {
     fn instrument_id(&self) -> &InstrumentId;
     fn adapter_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
     fn payout_rail(&self) -> &str;
     fn settle(&self, request: &SettlementRequest) -> anyhow::Result<String>;
 }
@@ -81,6 +84,13 @@ impl SettlementAdapterRegistry {
             .map(|(instrument, adapter)| {
                 (instrument.clone(), adapter.adapter_identity().to_string())
             })
+            .collect()
+    }
+
+    pub fn production_qualifications(&self) -> BTreeMap<String, bool> {
+        self.adapters
+            .iter()
+            .map(|(instrument, adapter)| (instrument.clone(), adapter.production_qualified()))
             .collect()
     }
 }
@@ -179,6 +189,9 @@ pub struct NearConfirmationEvidence {
 
 pub trait NearPayoutAdapter: Send + Sync {
     fn adapter_identity(&self) -> &str;
+    fn production_qualified(&self) -> bool {
+        false
+    }
     fn submit(&self, call: &NearCreditReceiptCall) -> anyhow::Result<String>;
     fn confirmation(&self, idempotency_key: &str) -> Option<NearConfirmationEvidence>;
 }

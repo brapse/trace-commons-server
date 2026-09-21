@@ -422,6 +422,17 @@ impl PgBackend {
         self.pool.clone()
     }
 
+    pub async fn readiness_probe(&self) -> Result<(), DatabaseError> {
+        self.pool
+            .get()
+            .await
+            .map_err(DatabaseError::from)?
+            .simple_query("SELECT 1")
+            .await
+            .map_err(DatabaseError::from)?;
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn trace_pool_for_test(&self) -> Pool {
         self.pool.clone()

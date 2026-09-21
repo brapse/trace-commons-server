@@ -55,7 +55,7 @@ digests come from the four policy configurations in the selected package.
 The command writes these files:
 
 - `.local/pipeline-qualification-report.json`
-- `.local/pipeline-lab-catalog-v1.json`
+- `.local/pipeline-lab-catalog.json`
 - `.local/pipeline-interface-inventory.json`
 - `.local/pipeline-restore-report.json`
 - `.local/pipeline-report.json`
@@ -67,11 +67,40 @@ Set `TRACE_COMMONS_PG_TEST_DATABASE_URL` to a PostgreSQL test database.
 Then run this command:
 
 ```bash
-cargo test -p trace-commons-server --test versioned_pipeline_pg
+cargo test -p trace-commons-server --test versioned_pipeline_runtime_pg
 ```
 
 CI supplies the database. Therefore, a skipped database test cannot qualify
 the candidate in CI.
+
+## Pinned Hugging Face qualification
+
+Run:
+
+```bash
+bash scripts/operator/run-pipeline-hf-qualification.sh
+```
+
+The command reads the repository, revision, split, sample counts, and expected
+digests from
+[`versioned-pipeline-hf-corpus-v1.json`](../superpowers/specs/versioned-pipeline-hf-corpus-v1.json).
+It downloads JSONL sessions only. It creates separate bootstrap and holdout
+corpora under `.local/pipeline-hf/`, then runs both through the local HTTP and
+worker path.
+
+The workflow fails if the dataset or order changes, the sample is incomplete,
+or replay, conflict, isolation, privacy, consent, scoring, settlement, or
+instrument results differ. Reports contain hashes, labels, and counts. They do
+not contain trace text or contributor identity.
+
+The HF report expires after seven days. Missing, failed, or stale HF evidence
+blocks production promotion. Ordinary CI runs the checked-in synthetic corpus
+and does not require network access.
+
+For an offline implementation check, set
+`TRACE_COMMONS_PIPELINE_HF_LOCAL_JSONL_DIR` to the checked-in JSONL fixture
+directory and supply its expected source and order digests. Offline evidence
+is local test evidence and does not replace the pinned HF promotion report.
 
 ## Production package registration
 

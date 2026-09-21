@@ -26,6 +26,9 @@ CREATE TABLE pipeline_bundle_qualifications (
     code_revision_hash TEXT NOT NULL CHECK (
         code_revision_hash ~ '^sha256:[0-9a-f]{64}$'
     ),
+    runtime_dependency_digest TEXT NOT NULL CHECK (
+        runtime_dependency_digest ~ '^sha256:[0-9a-f]{64}$'
+    ),
     evidence_hash TEXT NOT NULL CHECK (
         evidence_hash ~ '^sha256:[0-9a-f]{64}$'
     ),
