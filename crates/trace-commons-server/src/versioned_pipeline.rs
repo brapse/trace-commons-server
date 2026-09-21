@@ -78,6 +78,9 @@ pub const PIPELINE_INDEX_UNAVAILABLE_LABEL: &str = "index_unavailable";
 pub const PIPELINE_INDEX_CONFLICT_LABEL: &str = "index_key_conflict";
 pub const PIPELINE_CREDIT_HELD_LABEL: &str = "credit_held";
 pub const PIPELINE_CREDIT_CAP_LABEL: &str = "credit_cap_exceeded";
+pub const PIPELINE_SUBMISSION_INOPERABLE_LABEL: &str = "submission_inoperable";
+pub const PIPELINE_TOMBSTONE_LABEL: &str = "content_tombstoned";
+pub const PIPELINE_INVALIDATION_FAILED_LABEL: &str = "index_invalidation_failed";
 const DEFAULT_LEASE_SECONDS: i64 = 30;
 const DEFAULT_RETRY_MILLISECONDS: i64 = 50;
 const INJECTED_PIPELINE_CRASH: &str = "injected_pipeline_crash";
@@ -160,7 +163,7 @@ impl PipelineRunState {
         }
     }
 
-    fn from_db(value: &str) -> Result<Self, DatabaseError> {
+    pub(crate) fn from_db(value: &str) -> Result<Self, DatabaseError> {
         match value {
             "pending" => Ok(Self::Pending),
             "leased" => Ok(Self::Leased),
@@ -184,7 +187,7 @@ fn phase_as_db(phase: Option<Phase>) -> &'static str {
     }
 }
 
-fn phase_from_db(value: &str) -> Result<Option<Phase>, DatabaseError> {
+pub(crate) fn phase_from_db(value: &str) -> Result<Option<Phase>, DatabaseError> {
     match value {
         "admission" => Ok(Some(Phase::Admission)),
         "review" => Ok(Some(Phase::Review)),
@@ -222,8 +225,25 @@ pub struct PipelineRunRecord {
     pub index_command_ref: Option<String>,
     pub index_command_hash: Option<String>,
     pub index_write_state: String,
+    pub index_invalidation_state: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineWithdrawalFollowUpState {
+    NotRequired,
+    Pending,
+    Complete,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelineWithdrawalOutcome {
+    pub withdrawal: crate::trace_corpus_storage::TraceWithdrawalRecord,
+    pub index_invalidation: PipelineWithdrawalFollowUpState,
+    pub revocation_propagation: PipelineWithdrawalFollowUpState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -582,6 +602,503 @@ impl PgPipelineStore {
         )
         .await?;
         Ok(())
+    }
+
+    pub async fn withdraw_submission(
+        &self,
+        tenant_id: &str,
+        submission_id: Uuid,
+        actor_principal_ref: &str,
+    ) -> Result<PipelineWithdrawalOutcome, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let submission = tx
+            .query_opt(
+                "SELECT status, auth_principal_ref, trace_id, redaction_hash,
+                        canonical_summary_hash
+                   FROM trace_submissions
+                  WHERE tenant_id = $1 AND submission_id = $2
+                  FOR UPDATE",
+                &[&tenant_id, &submission_id],
+            )
+            .await?
+            .ok_or_else(|| DatabaseError::NotFound {
+                entity: "trace_submission".to_string(),
+                id: submission_id.to_string(),
+            })?;
+        if submission.get::<_, String>("auth_principal_ref") != actor_principal_ref {
+            return Err(DatabaseError::NotFound {
+                entity: "trace_submission".to_string(),
+                id: submission_id.to_string(),
+            });
+        }
+
+        let run_row = tx
+            .query_opt(
+                "SELECT *
+                   FROM pipeline_runs
+                  WHERE tenant_id = $1 AND submission_id = $2
+                  ORDER BY created_at DESC
+                  LIMIT 1
+                  FOR UPDATE",
+                &[&tenant_id, &submission_id],
+            )
+            .await?;
+        let prior_status: String = submission.get("status");
+        let trace_id: Uuid = submission.get("trace_id");
+        let redaction_hash: String = submission.get("redaction_hash");
+        let canonical_summary_hash: Option<String> = submission.get("canonical_summary_hash");
+        let object_rows = tx
+            .query(
+                "SELECT object_ref_id
+                   FROM trace_object_refs
+                  WHERE tenant_id = $1 AND submission_id = $2
+                    AND deleted_at IS NULL
+                  ORDER BY object_ref_id",
+                &[&tenant_id, &submission_id],
+            )
+            .await?;
+        let has_managed_export = tx
+            .query_one(
+                "SELECT EXISTS (
+                    SELECT 1
+                      FROM trace_export_manifest_items
+                     WHERE tenant_id = $1 AND submission_id = $2
+                       AND source_invalidated_at IS NULL
+                ) AS present",
+                &[&tenant_id, &submission_id],
+            )
+            .await?
+            .get::<_, bool>("present");
+        let has_approved_revision = run_row
+            .as_ref()
+            .and_then(|row| row.get::<_, Option<Uuid>>("approved_revision_id"))
+            .is_some();
+        let distribution_reach = if has_managed_export {
+            "commons_distributed"
+        } else if has_approved_revision {
+            "commons_not_distributed"
+        } else {
+            "not_distributed"
+        };
+
+        tx.execute(
+            "INSERT INTO trace_withdrawals (
+                tenant_id, submission_id, withdrawn_at, prior_status, distribution_reach
+             ) VALUES ($1,$2,NOW(),$3,$4)
+             ON CONFLICT (tenant_id, submission_id) DO NOTHING",
+            &[
+                &tenant_id,
+                &submission_id,
+                &prior_status,
+                &distribution_reach,
+            ],
+        )
+        .await?;
+        let tombstone_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("pipeline-withdrawal:{tenant_id}:{submission_id}").as_bytes(),
+        );
+        tx.execute(
+            "INSERT INTO trace_tombstones (
+                tenant_id, tombstone_id, submission_id, trace_id, redaction_hash,
+                canonical_summary_hash, reason, effective_at, created_by_principal_ref
+             ) VALUES ($1,$2,$3,$4,$5,$6,'withdrawn',NOW(),$7)
+             ON CONFLICT (tenant_id, submission_id) DO NOTHING",
+            &[
+                &tenant_id,
+                &tombstone_id,
+                &submission_id,
+                &trace_id,
+                &redaction_hash,
+                &canonical_summary_hash,
+                &actor_principal_ref,
+            ],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE trace_submissions
+                SET status = 'revoked',
+                    withdrawn_at = COALESCE(withdrawn_at, NOW()),
+                    revoked_at = COALESCE(revoked_at, NOW()),
+                    updated_at = NOW()
+              WHERE tenant_id = $1 AND submission_id = $2",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE trace_object_refs
+                SET invalidated_at = COALESCE(invalidated_at, NOW()), updated_at = NOW()
+              WHERE tenant_id = $1 AND submission_id = $2 AND invalidated_at IS NULL",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE trace_derived_records
+                SET status = 'revoked', updated_at = NOW()
+              WHERE tenant_id = $1 AND submission_id = $2 AND status <> 'revoked'",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE trace_vector_entries
+                SET status = 'invalidated',
+                    invalidated_at = COALESCE(invalidated_at, NOW()), updated_at = NOW()
+              WHERE tenant_id = $1 AND submission_id = $2
+                AND status <> 'invalidated' AND deleted_at IS NULL",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE trace_export_manifest_items
+                SET source_invalidated_at = COALESCE(source_invalidated_at, NOW()),
+                    source_invalidation_reason = 'revoked', updated_at = NOW()
+              WHERE tenant_id = $1 AND submission_id = $2
+                AND source_invalidated_at IS NULL",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE trace_export_manifests
+                SET invalidated_at = COALESCE(invalidated_at, NOW()), updated_at = NOW()
+              WHERE tenant_id = $1 AND $2 = ANY(source_submission_ids)
+                AND invalidated_at IS NULL AND deleted_at IS NULL",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE pipeline_export_snapshot_items
+                SET invalidated_at = COALESCE(invalidated_at, NOW()),
+                    invalidation_reason = 'withdrawn'
+              WHERE tenant_id = $1 AND submission_id = $2
+                AND invalidated_at IS NULL",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+        tx.execute(
+            "UPDATE pipeline_export_snapshots snapshot
+                SET state = 'invalidated',
+                    invalidated_at = COALESCE(snapshot.invalidated_at, NOW())
+              WHERE snapshot.tenant_id = $1
+                AND snapshot.state <> 'invalidated'
+                AND EXISTS (
+                    SELECT 1
+                      FROM pipeline_export_snapshot_items item
+                     WHERE item.tenant_id = snapshot.tenant_id
+                       AND item.snapshot_id = snapshot.snapshot_id
+                       AND item.submission_id = $2
+                )",
+            &[&tenant_id, &submission_id],
+        )
+        .await?;
+
+        let mut index_invalidation = PipelineWithdrawalFollowUpState::NotRequired;
+        if let Some(run_row) = run_row.as_ref() {
+            let run = pipeline_run_from_row(run_row)?;
+            if run.index_write_state == "complete" {
+                if let Some(revision_id) = run.approved_revision_id {
+                    tx.execute(
+                        "INSERT INTO pipeline_index_invalidations (
+                            tenant_id, run_id, submission_id, registry_revision_id, reason_code
+                         ) VALUES ($1,$2,$3,$4,'withdrawn')
+                         ON CONFLICT (tenant_id, run_id) DO NOTHING",
+                        &[&tenant_id, &run.run_id, &submission_id, &revision_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE pipeline_runs
+                            SET index_invalidation_state = 'pending', updated_at = NOW()
+                          WHERE tenant_id = $1 AND run_id = $2
+                            AND index_invalidation_state = 'none'",
+                        &[&tenant_id, &run.run_id],
+                    )
+                    .await?;
+                    index_invalidation = PipelineWithdrawalFollowUpState::Pending;
+                }
+            } else if run.index_write_state == "pending" {
+                tx.execute(
+                    "UPDATE pipeline_runs
+                        SET index_membership = 'excluded',
+                            index_write_state = 'cancelled',
+                            updated_at = NOW()
+                      WHERE tenant_id = $1 AND run_id = $2",
+                    &[&tenant_id, &run.run_id],
+                )
+                .await?;
+                index_invalidation = PipelineWithdrawalFollowUpState::Complete;
+            }
+            if run.next_phase != Some(Phase::Settle)
+                && run.state != PipelineRunState::Complete
+                && run.state != PipelineRunState::Failed
+            {
+                tx.execute(
+                    "UPDATE pipeline_runs
+                        SET state = 'failed', last_error_label = $3,
+                            lease_token = NULL, lease_expires_at = NULL, updated_at = NOW()
+                      WHERE tenant_id = $1 AND run_id = $2",
+                    &[
+                        &tenant_id,
+                        &run.run_id,
+                        &PIPELINE_SUBMISSION_INOPERABLE_LABEL,
+                    ],
+                )
+                .await?;
+            }
+        }
+
+        for row in &object_rows {
+            let object_ref_id: Uuid = row.get("object_ref_id");
+            let idempotency_key = sha256_prefixed(
+                format!(
+                    "pipeline-withdrawal-object-delete:v1:{tenant_id}:{submission_id}:{object_ref_id}"
+                )
+                .as_bytes(),
+            );
+            let propagation_item_id =
+                Uuid::new_v5(&Uuid::NAMESPACE_URL, idempotency_key.as_bytes());
+            let target_json = serde_json::json!({
+                "kind": "object_ref",
+                "object_ref_id": object_ref_id,
+            });
+            let metadata_json = serde_json::json!({"source": "versioned_pipeline"});
+            tx.execute(
+                "INSERT INTO trace_revocation_propagation_items (
+                    tenant_id, propagation_item_id, source_submission_id, trace_id,
+                    target_kind, target_json, action, status, idempotency_key, reason,
+                    attempt_count, metadata_json
+                 ) VALUES (
+                    $1,$2,$3,$4,'object_ref',$5,'delete_object_payload','pending',$6,
+                    'pipeline_withdrawal',0,$7
+                 )
+                 ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+                &[
+                    &tenant_id,
+                    &propagation_item_id,
+                    &submission_id,
+                    &trace_id,
+                    &target_json,
+                    &idempotency_key,
+                    &metadata_json,
+                ],
+            )
+            .await?;
+        }
+
+        let audit_event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("pipeline-withdrawal-audit:{tenant_id}:{submission_id}").as_bytes(),
+        );
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtext($1)::bigint)",
+            &[&tenant_id],
+        )
+        .await?;
+        let audit_exists = tx
+            .query_opt(
+                "SELECT 1
+                   FROM trace_audit_events
+                  WHERE tenant_id = $1 AND audit_event_id = $2",
+                &[&tenant_id, &audit_event_id],
+            )
+            .await?
+            .is_some();
+        if !audit_exists {
+            let audit_sequence: i64 = tx
+                .query_one(
+                    "SELECT COALESCE(MAX(audit_sequence), 0) + 1
+                       FROM trace_audit_events
+                      WHERE tenant_id = $1",
+                    &[&tenant_id],
+                )
+                .await?
+                .get(0);
+            let reason_hash = sha256_prefixed(b"pipeline_withdrawal");
+            let metadata_json =
+                serde_json::json!({"kind": "revocation", "reason_hash": reason_hash});
+            tx.execute(
+                "INSERT INTO trace_audit_events (
+                    tenant_id, audit_sequence, audit_event_id, actor_principal_ref,
+                    actor_role, action, reason, submission_id, decision_inputs_hash,
+                    metadata_json
+                 ) VALUES (
+                    $1,$2,$3,$4,'contributor','revoke','pipeline_withdrawal',$5,$6,$7
+                 )",
+                &[
+                    &tenant_id,
+                    &audit_sequence,
+                    &audit_event_id,
+                    &actor_principal_ref,
+                    &submission_id,
+                    &reason_hash,
+                    &metadata_json,
+                ],
+            )
+            .await?;
+        }
+
+        let withdrawal_row = tx
+            .query_one(
+                "SELECT tenant_id, submission_id, withdrawn_at, prior_status, distribution_reach
+                   FROM trace_withdrawals
+                  WHERE tenant_id = $1 AND submission_id = $2",
+                &[&tenant_id, &submission_id],
+            )
+            .await?;
+        let pending_propagation: i64 = tx
+            .query_one(
+                "SELECT COUNT(*)::bigint
+                   FROM trace_revocation_propagation_items
+                  WHERE tenant_id = $1 AND source_submission_id = $2
+                    AND status IN ('pending', 'in_progress', 'failed')",
+                &[&tenant_id, &submission_id],
+            )
+            .await?
+            .get(0);
+        let revocation_propagation = if pending_propagation > 0 {
+            PipelineWithdrawalFollowUpState::Pending
+        } else if object_rows.is_empty() {
+            PipelineWithdrawalFollowUpState::NotRequired
+        } else {
+            PipelineWithdrawalFollowUpState::Complete
+        };
+        if run_row.is_some() {
+            let state: String = tx
+                .query_one(
+                    "SELECT index_invalidation_state
+                       FROM pipeline_runs
+                      WHERE tenant_id = $1 AND submission_id = $2
+                      ORDER BY created_at DESC
+                      LIMIT 1",
+                    &[&tenant_id, &submission_id],
+                )
+                .await?
+                .get("index_invalidation_state");
+            index_invalidation = match state.as_str() {
+                "pending" => PipelineWithdrawalFollowUpState::Pending,
+                "complete" => PipelineWithdrawalFollowUpState::Complete,
+                "failed" => PipelineWithdrawalFollowUpState::Failed,
+                _ => index_invalidation,
+            };
+        }
+        let withdrawal = crate::trace_corpus_storage::TraceWithdrawalRecord {
+            tenant_id: withdrawal_row.get("tenant_id"),
+            submission_id: withdrawal_row.get("submission_id"),
+            withdrawn_at: withdrawal_row.get("withdrawn_at"),
+            prior_status: withdrawal_row.get("prior_status"),
+            distribution_reach: withdrawal_row.get("distribution_reach"),
+        };
+        tx.commit().await?;
+        Ok(PipelineWithdrawalOutcome {
+            withdrawal,
+            index_invalidation,
+            revocation_propagation,
+        })
+    }
+
+    pub async fn complete_index_invalidation(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+    ) -> Result<PipelineRunRecord, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        tx.execute(
+            "UPDATE pipeline_index_invalidations
+                SET state = 'complete', completed_at = COALESCE(completed_at, NOW()),
+                    last_error_label = NULL
+              WHERE tenant_id = $1 AND run_id = $2",
+            &[&tenant_id, &run_id],
+        )
+        .await?;
+        let row = tx
+            .query_one(
+                "UPDATE pipeline_runs
+                    SET index_invalidation_state = 'complete', updated_at = NOW()
+                  WHERE tenant_id = $1 AND run_id = $2
+                  RETURNING *",
+                &[&tenant_id, &run_id],
+            )
+            .await?;
+        let run = pipeline_run_from_row(&row)?;
+        tx.commit().await?;
+        Ok(run)
+    }
+
+    pub async fn claim_index_invalidation(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+    ) -> Result<Option<PipelineRunRecord>, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let claimed = tx
+            .execute(
+                "UPDATE pipeline_index_invalidations
+                    SET attempt_count = attempt_count + 1
+                  WHERE tenant_id = $1 AND run_id = $2
+                    AND state = 'pending'
+                    AND next_attempt_at <= NOW()
+                    AND attempt_count < max_attempts",
+                &[&tenant_id, &run_id],
+            )
+            .await?;
+        let run = if claimed == 1 {
+            tx.query_opt(
+                "SELECT * FROM pipeline_runs WHERE tenant_id = $1 AND run_id = $2",
+                &[&tenant_id, &run_id],
+            )
+            .await?
+            .as_ref()
+            .map(pipeline_run_from_row)
+            .transpose()?
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(run)
+    }
+
+    pub async fn fail_index_invalidation(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+    ) -> Result<PipelineRunRecord, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let row = tx
+            .query_one(
+                "UPDATE pipeline_index_invalidations
+                    SET state = CASE
+                            WHEN attempt_count >= max_attempts THEN 'failed'
+                            ELSE 'pending'
+                        END,
+                        last_error_label = $3,
+                        next_attempt_at = CASE
+                            WHEN attempt_count >= max_attempts THEN next_attempt_at
+                            ELSE NOW() + INTERVAL '50 milliseconds'
+                        END
+                  WHERE tenant_id = $1 AND run_id = $2
+                  RETURNING state",
+                &[&tenant_id, &run_id, &PIPELINE_INVALIDATION_FAILED_LABEL],
+            )
+            .await?;
+        let terminal = row.get::<_, String>("state") == "failed";
+        let row = tx
+            .query_one(
+                "UPDATE pipeline_runs
+                    SET index_invalidation_state = $3, updated_at = NOW()
+                  WHERE tenant_id = $1 AND run_id = $2
+                  RETURNING *",
+                &[
+                    &tenant_id,
+                    &run_id,
+                    &(if terminal { "failed" } else { "pending" }),
+                ],
+            )
+            .await?;
+        let run = pipeline_run_from_row(&row)?;
+        tx.commit().await?;
+        Ok(run)
     }
 
     pub async fn list_cleanup_orphans(
@@ -1625,6 +2142,7 @@ fn pipeline_run_from_row(row: &Row) -> Result<PipelineRunRecord, DatabaseError> 
         index_command_ref: row.get("index_command_ref"),
         index_command_hash: row.get("index_command_hash"),
         index_write_state: row.get("index_write_state"),
+        index_invalidation_state: row.get("index_invalidation_state"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -2323,6 +2841,15 @@ pub trait IdentifiedIndexReader: VectorIndexReader {
 
 pub trait IdentifiedIndexWriter: VectorIndexWriter {
     fn dependency_identity(&self) -> &str;
+
+    fn invalidate_revision(
+        &self,
+        _tenant_id: &str,
+        _index_id: &str,
+        _revision_id: Uuid,
+    ) -> Result<bool, IndexWriteError> {
+        Err(IndexWriteError::Failed)
+    }
 }
 
 impl IdentifiedPerplexityScorer for ReferencePerplexityScorer {
@@ -2346,6 +2873,15 @@ impl IdentifiedIndexReader for IsolatedPipelineIndex {
 impl IdentifiedIndexWriter for IsolatedPipelineIndex {
     fn dependency_identity(&self) -> &str {
         "isolated_index_writer_test_only"
+    }
+
+    fn invalidate_revision(
+        &self,
+        tenant_id: &str,
+        index_id: &str,
+        revision_id: Uuid,
+    ) -> Result<bool, IndexWriteError> {
+        self.try_invalidate_revision(tenant_id, index_id, revision_id)
     }
 }
 
@@ -2804,6 +3340,36 @@ impl PipelineService {
             self.compatibility_runtime.as_ref(),
         )
         .map_err(|_| anyhow::anyhow!(PIPELINE_BUNDLE_INVALID_LABEL))?;
+        let tombstoned: bool = tx
+            .query_one(
+                "SELECT
+                    EXISTS (
+                        SELECT 1
+                          FROM trace_withdrawals
+                         WHERE tenant_id = $1 AND submission_id = $2
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                          FROM trace_tombstones
+                         WHERE tenant_id = $1
+                           AND (
+                                submission_id = $2
+                                OR trace_id = $3
+                                OR redaction_hash = $4
+                                OR redaction_hash = $5
+                           )
+                    )",
+                &[
+                    &tenant_id,
+                    &envelope.submission_id,
+                    &envelope.trace_id,
+                    &envelope.privacy.redaction_hash,
+                    &request_content_hash,
+                ],
+            )
+            .await?
+            .get(0);
+        anyhow::ensure!(!tombstoned, PIPELINE_TOMBSTONE_LABEL);
         let run = NewPipelineRun {
             tenant_id: tenant_id.to_string(),
             run_id,
@@ -2849,7 +3415,7 @@ impl PipelineService {
                 grant_valid: authenticated && authority_valid,
                 consent_valid: envelope.consent.revocable && authority_valid,
                 allowed_uses_valid: authority_valid,
-                tombstoned: false,
+                tombstoned,
                 quota_available: true,
                 privacy_risk: admission_privacy_risk,
             })
@@ -2924,6 +3490,56 @@ impl PipelineService {
         };
         let outcomes = self.store.list_outcomes(tenant_id, run_id).await?;
         Ok(Some(PipelineInspection { run, outcomes }))
+    }
+
+    pub async fn withdraw_submission(
+        &self,
+        tenant_id: &str,
+        submission_id: Uuid,
+        actor_principal_ref: &str,
+    ) -> Result<PipelineWithdrawalOutcome, DatabaseError> {
+        self.store
+            .withdraw_submission(tenant_id, submission_id, actor_principal_ref)
+            .await
+    }
+
+    pub async fn process_index_invalidation(
+        &self,
+        tenant_id: &str,
+        run_id: Uuid,
+    ) -> anyhow::Result<Option<PipelineRunRecord>> {
+        let Some(run) = self.store.get_run(tenant_id, run_id).await? else {
+            return Ok(None);
+        };
+        if run.index_invalidation_state != "pending" {
+            return Ok(Some(run));
+        }
+        let Some(run) = self
+            .store
+            .claim_index_invalidation(tenant_id, run_id)
+            .await?
+        else {
+            return Ok(Some(run));
+        };
+        let revision_id = run
+            .approved_revision_id
+            .ok_or_else(|| anyhow::anyhow!("invalidation revision is missing"))?;
+        if self
+            .index_writer
+            .invalidate_revision(tenant_id, PIPELINE_INDEX_ID, revision_id)
+            .is_err()
+        {
+            return Ok(Some(
+                self.store
+                    .fail_index_invalidation(tenant_id, run_id)
+                    .await?,
+            ));
+        }
+        Ok(Some(
+            self.store
+                .complete_index_invalidation(tenant_id, run_id)
+                .await?,
+        ))
     }
 
     pub async fn process_one(
@@ -3184,13 +3800,24 @@ impl PipelineService {
         let score_evidence =
             serde_json::from_value::<ScoreEvidence>(score_outcome.evidence.clone())
                 .map_err(|_| anyhow::anyhow!("Score evidence is malformed"))?;
+        let submission = self
+            .backend
+            .get_trace_submission(&run.tenant_id, run.submission_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("submission is missing"))?;
+        let submission_operable = submission.status == TraceCorpusStatus::Accepted
+            && submission.revoked_at.is_none()
+            && submission.purged_at.is_none()
+            && submission
+                .expires_at
+                .is_none_or(|expires_at| expires_at > Utc::now());
         let mut settlements = self
             .store
             .list_settlements(&run.tenant_id, run.run_id)
             .await?;
         let decision = if run.index_membership == "undecided" {
             self.settle_evaluations.fetch_add(1, Ordering::SeqCst);
-            let result = bundle
+            let mut result = bundle
                 .settle
                 .execute(&SettleInput {
                     run_id: run.run_id,
@@ -3201,6 +3828,16 @@ impl PipelineService {
                     score_evidence: score_evidence.clone(),
                 })
                 .await?;
+            if !submission_operable {
+                result.decision = SettleDecision::new(
+                    IndexMembershipDecision::Exclude {
+                        reason: ReasonCode::new(PIPELINE_SUBMISSION_INOPERABLE_LABEL)
+                            .expect("static safe label"),
+                    },
+                    &score.awards,
+                    result.decision.settlement_operations().to_vec(),
+                )?;
+            }
             settlements = self
                 .store
                 .seed_settlements(
@@ -3284,9 +3921,20 @@ impl PipelineService {
                     .map_err(anyhow::Error::from)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            SettleDecision::new(index_membership, &score.awards, operations)?
+            SettleDecision::new(
+                if submission_operable {
+                    index_membership
+                } else {
+                    IndexMembershipDecision::Exclude {
+                        reason: ReasonCode::new(PIPELINE_SUBMISSION_INOPERABLE_LABEL)
+                            .expect("static safe label"),
+                    }
+                },
+                &score.awards,
+                operations,
+            )?
         };
-        if run.index_write_state == "pending" {
+        if submission_operable && run.index_write_state == "pending" {
             self.ensure_live_lease(&run).await?;
             let command = self.load_sealed_command(&run).await?;
             let mut apply_failed = false;
@@ -3308,7 +3956,9 @@ impl PipelineService {
                 run = self.store.mark_index_write_state(&run, "complete").await?;
             }
         }
-        let index_complete = run.index_write_state == "none" || run.index_write_state == "complete";
+        let index_complete = !submission_operable
+            || run.index_write_state == "none"
+            || run.index_write_state == "complete";
         let mut settlement_blocked = false;
         let mut held = false;
         for settlement in settlements.clone() {
@@ -3459,10 +4109,20 @@ impl PipelineService {
             .store
             .list_settlements(&run.tenant_id, run.run_id)
             .await?;
+        let index_operation_required = submission_operable
+            && matches!(
+                decision.index_membership,
+                IndexMembershipDecision::Include { .. }
+            );
+        let final_index_membership = if index_operation_required {
+            "included"
+        } else {
+            "excluded"
+        };
         let result = PhaseResult {
             decision,
             evidence: SettleEvidence {
-                index_operation_required: run.index_membership == "included",
+                index_operation_required,
                 settlement_operations_required: u32::try_from(settlements.len())
                     .unwrap_or(u32::MAX),
                 index_command_hash: run.index_command_hash.clone(),
@@ -3481,11 +4141,16 @@ impl PipelineService {
                     })
                     .collect::<Result<Vec<_>, trace_commons_gate_api::pipeline::ContractError>>()?,
                 index_progress: Some(run.index_write_state.clone()),
-                submission_operable: Some(true),
-                guard_reason: None,
+                submission_operable: Some(submission_operable),
+                guard_reason: (!submission_operable).then(|| {
+                    ReasonCode::new(PIPELINE_SUBMISSION_INOPERABLE_LABEL)
+                        .expect("static safe label")
+                }),
             },
             evaluation: SettleEvaluation {
-                rule_id: if run.index_membership == "included" {
+                rule_id: if !submission_operable {
+                    "minimal_settle_inoperable_v1".to_string()
+                } else if index_operation_required {
                     "minimal_settle_include_v1".to_string()
                 } else {
                     "minimal_settle_exclude_v1".to_string()
@@ -3497,7 +4162,7 @@ impl PipelineService {
             .commit_settle(
                 &run,
                 StoredPhaseResult::from_result(Phase::Settle, &result)?,
-                &run.index_membership,
+                final_index_membership,
             )
             .await?;
         self.inject_crash(PipelineCrashPoint::AfterSettleCommit)?;
@@ -3999,27 +4664,49 @@ impl PipelineService {
     }
 
     async fn load_source_bytes(&self, run: &PipelineRunRecord) -> anyhow::Result<Vec<u8>> {
-        let object_ref = self
-            .backend
-            .list_trace_object_refs(&run.tenant_id, run.submission_id)
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = PgPipelineStore::tenant_transaction(&mut client, &run.tenant_id).await?;
+        let object_ref = tx
+            .query_opt(
+                "SELECT object_ref.object_key, object_ref.content_sha256,
+                        object_ref.created_at
+                   FROM trace_submissions submission
+                   JOIN trace_object_refs object_ref
+                     ON object_ref.tenant_id = submission.tenant_id
+                    AND object_ref.submission_id = submission.submission_id
+                  WHERE submission.tenant_id = $1
+                    AND submission.submission_id = $2
+                    AND object_ref.object_ref_id = $3
+                    AND submission.status NOT IN ('revoked', 'expired', 'purged')
+                    AND submission.revoked_at IS NULL
+                    AND submission.purged_at IS NULL
+                    AND (submission.expires_at IS NULL OR submission.expires_at > NOW())
+                    AND object_ref.invalidated_at IS NULL
+                    AND object_ref.deleted_at IS NULL
+                  FOR SHARE OF submission, object_ref",
+                &[
+                    &run.tenant_id,
+                    &run.submission_id,
+                    &run.source_object_ref_id,
+                ],
+            )
             .await?
-            .into_iter()
-            .find(|object_ref| object_ref.object_ref_id == run.source_object_ref_id)
-            .ok_or_else(|| anyhow::anyhow!("source artifact reference is missing"))?;
+            .ok_or_else(|| anyhow::anyhow!(PIPELINE_SUBMISSION_INOPERABLE_LABEL))?;
         let receipt = EncryptedTraceArtifactReceipt {
             tenant_storage_ref: tenant_storage_ref(&run.tenant_id),
             artifact_kind: TraceArtifactKind::ContributionEnvelope,
-            object_key: object_ref.object_key,
+            object_key: object_ref.get("object_key"),
             ciphertext_sha256: object_ref
-                .content_sha256
+                .get::<_, String>("content_sha256")
                 .strip_prefix("sha256:")
                 .ok_or_else(|| anyhow::anyhow!("source artifact hash is malformed"))?
                 .to_string(),
-            encrypted_at: object_ref.created_at,
+            encrypted_at: object_ref.get("created_at"),
         };
         let wrapper = self
             .artifact_store
             .read_json(&receipt.tenant_storage_ref, &receipt)?;
+        tx.commit().await?;
         let encoded = wrapper
             .get("request_bytes_base64")
             .and_then(serde_json::Value::as_str)

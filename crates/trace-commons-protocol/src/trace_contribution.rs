@@ -8063,6 +8063,32 @@ pub struct TraceSubmissionStatusRequest {
     pub submission_ids: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TraceInstrumentStatusUpdate {
+    pub instrument_id: String,
+    pub atomic_units: u64,
+    pub operation_state: String,
+    pub internal_settlement_state: String,
+    pub payout_rail: String,
+    pub payout_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_label: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TracePipelineStatusUpdate {
+    pub run_id: Uuid,
+    pub bundle_id: String,
+    pub processing_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responsible_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_label: Option<String>,
+    pub instruments: Vec<TraceInstrumentStatusUpdate>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TraceSubmissionStatusUpdate {
     pub submission_id: Uuid,
@@ -8081,6 +8107,8 @@ pub struct TraceSubmissionStatusUpdate {
     pub delayed_credit_explanations: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub consent_scopes: Vec<ConsentScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<TracePipelineStatusUpdate>,
 }
 
 pub fn apply_credit_estimate_to_envelope(envelope: &mut TraceContributionEnvelope) {

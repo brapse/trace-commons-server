@@ -52,8 +52,9 @@ use trace_commons_protocol::trace_contribution::{
     ConsentMetadata, ConsentScope, EmbeddingAnalysisMetadata, PiiClassifyPolicy,
     PrivacyFilterBackendTag, ProcessEvalRating, ProcessEvaluationLabels, ResidualPiiRisk,
     TRACE_CONTRIBUTION_SCHEMA_VERSION, TraceAllowedUse, TraceContributionEnvelope,
-    TraceSubmissionReceipt, TraceSubmissionStatusRequest, TraceSubmissionStatusUpdate,
-    TraceValueScorecard, apply_credit_estimate_to_envelope, canonical_summary_for_embedding,
+    TraceInstrumentStatusUpdate, TracePipelineStatusUpdate, TraceSubmissionReceipt,
+    TraceSubmissionStatusRequest, TraceSubmissionStatusUpdate, TraceValueScorecard,
+    apply_credit_estimate_to_envelope, canonical_summary_for_embedding,
     privacy_filter_backend_from_env, rescrub_envelope_prose_pii_with, rescrub_trace_envelope,
     retention_policy_for_allowed_use, retention_policy_for_trace, run_privacy_filter_canary,
 };
@@ -86,6 +87,7 @@ use trace_commons_server::account_passkey::{
 };
 use trace_commons_server::config::{DatabaseConfig, NearConfig, WebauthnConfig};
 use trace_commons_server::db::DeviceKeyRecord as StorageDeviceKeyRecord;
+use trace_commons_server::db::postgres::PgBackend;
 use trace_commons_server::db::{
     CreditSettlementAdvisoryLock, Database, PayoutHoldReason, PayoutResolution,
     TraceCorpusRlsDiagnostics,
@@ -240,6 +242,11 @@ use trace_commons_server::trace_gate_service::{
 use trace_commons_server::trace_score_attestation::{
     AttestationConfig, AttestationSigningState, ScoreAttestationCoverage, ScoreAttestationScope,
     ScoreAttestationSubmissionEntry, sign_scoped_score_attestation, sign_score_attestation,
+    sign_versioned_score_attestation,
+};
+use trace_commons_server::versioned_pipeline_product::{
+    PipelineContributorStatus, PipelineExportSnapshot, PipelineForensicTrace,
+    PipelineOperationalSummary, PipelineProductStore, sha256_prefixed as product_sha256_prefixed,
 };
 use uuid::Uuid;
 
@@ -1553,6 +1560,7 @@ struct AppState {
     tenant_policies: Arc<BTreeMap<String, TenantSubmissionPolicy>>,
     require_tenant_submission_policy: bool,
     db_mirror: Option<Arc<dyn Database>>,
+    pipeline_product: Option<PipelineProductStore>,
     db_contributor_reads: bool,
     db_reviewer_reads: bool,
     db_reviewer_require_object_refs: bool,
@@ -3523,7 +3531,13 @@ impl AppState {
         let tenant_policies = parse_tenant_submission_policies_from_env()?;
         let require_tenant_submission_policy =
             env_truthy("TRACE_COMMONS_REQUIRE_TENANT_SUBMISSION_POLICY");
-        let db_mirror = trace_corpus_db_mirror_from_env().await?;
+        let db_connections = trace_corpus_db_mirror_from_env().await?;
+        let db_mirror = db_connections
+            .as_ref()
+            .map(|connections| connections.database.clone());
+        let pipeline_product = db_connections
+            .as_ref()
+            .map(|connections| PipelineProductStore::new(connections.postgres.clone()));
         let postgres_runtime_role_sha256 = parse_postgres_runtime_role_sha256_from_env()?;
         let require_postgres_trace_rls_ready =
             env_truthy(TRACE_COMMONS_REQUIRE_POSTGRES_TRACE_RLS_READY);
@@ -4123,6 +4137,7 @@ impl AppState {
             tenant_policies: Arc::new(tenant_policies),
             require_tenant_submission_policy,
             db_mirror,
+            pipeline_product,
             db_contributor_reads,
             db_reviewer_reads,
             db_reviewer_require_object_refs,
@@ -7140,7 +7155,12 @@ fn parse_optional_scheduler_i64_env(
     Ok(value)
 }
 
-async fn trace_corpus_db_mirror_from_env() -> anyhow::Result<Option<Arc<dyn Database>>> {
+struct TraceCorpusDbConnections {
+    database: Arc<dyn Database>,
+    postgres: Arc<PgBackend>,
+}
+
+async fn trace_corpus_db_mirror_from_env() -> anyhow::Result<Option<TraceCorpusDbConnections>> {
     if !env_truthy("TRACE_COMMONS_DB_DUAL_WRITE") {
         return Ok(None);
     }
@@ -7152,11 +7172,18 @@ async fn trace_corpus_db_mirror_from_env() -> anyhow::Result<Option<Arc<dyn Data
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(5);
     let config = DatabaseConfig::from_postgres_url(&url, pool_size);
-    let db = trace_commons_server::db::connect_from_config(&config)
+    let postgres = Arc::new(
+        PgBackend::new(&config)
+            .await
+            .context("failed to connect Trace Commons DB dual-write mirror")?,
+    );
+    postgres
+        .run_migrations()
         .await
-        .context("failed to connect Trace Commons DB dual-write mirror")?;
+        .context("failed to migrate Trace Commons DB dual-write mirror")?;
+    let database = postgres.clone() as Arc<dyn Database>;
     tracing::info!("Trace Commons PostgreSQL DB dual-write mirror enabled");
-    Ok(Some(db))
+    Ok(Some(TraceCorpusDbConnections { database, postgres }))
 }
 
 async fn validate_required_postgres_trace_rls_ready(
@@ -7666,6 +7693,27 @@ fn app(state: Arc<AppState>) -> Router {
         .route(
             "/v1/contributors/me/score-attestation",
             get(score_attestation_handler).post(scoped_score_attestation_handler),
+        )
+        .route(
+            "/v1/contributors/me/pipeline-score-attestation",
+            get(pipeline_score_attestation_handler),
+        )
+        .route(
+            "/v1/contributors/me/pipeline-submissions/{submission_id}/withdraw",
+            post(pipeline_withdrawal_handler),
+        )
+        .route("/v1/pipeline/exports", post(create_pipeline_export_handler))
+        .route(
+            "/v1/pipeline/exports/{snapshot_id}/complete",
+            post(complete_pipeline_export_handler),
+        )
+        .route(
+            "/v1/admin/pipeline/operational-summary",
+            get(pipeline_operational_summary_handler),
+        )
+        .route(
+            "/v1/admin/pipeline/runs/{run_id}/forensic",
+            get(pipeline_forensic_trace_handler),
         )
         .route(
             "/.well-known/trace-commons-attestation-keyset.json",
@@ -14866,6 +14914,7 @@ async fn submission_status_handler(
         .await
         .map_err(internal_error)?;
     let account_principals = account_scope.as_ref().map(CreditAccountScope::principals);
+    let requested_submission_ids = body.submission_ids;
     let credit_view =
         read_contributor_credit_view(state.as_ref(), tenant.auth(), account_principals)
             .await
@@ -14883,14 +14932,40 @@ async fn submission_status_handler(
     )
     .await
     .map_err(internal_error)?;
+    let pipeline_statuses = if let Some(product) = state.pipeline_product.as_ref() {
+        let principal_refs = account_principals.map_or_else(
+            || vec![tenant.principal_ref().to_string()],
+            AccountPrincipalSet::to_vec,
+        );
+        product
+            .contributor_statuses_for_principals(
+                tenant.tenant_id(),
+                &principal_refs,
+                &requested_submission_ids,
+            )
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
+    let pipeline_by_submission = pipeline_statuses
+        .into_iter()
+        .map(|status| (status.submission_id, status))
+        .collect::<BTreeMap<_, _>>();
     let mut statuses = Vec::new();
-    for submission_id in body.submission_ids {
+    for submission_id in requested_submission_ids {
         if let Some(record) = visible_by_submission.get(&submission_id) {
-            statuses.push(submission_status_from_record(
+            let mut status = submission_status_from_record(
                 record,
                 &status_credit_events,
                 state.near_settlement_mode,
-            ));
+            );
+            status.pipeline = pipeline_by_submission
+                .get(&submission_id)
+                .map(pipeline_status_for_protocol);
+            statuses.push(status);
+        } else if let Some(pipeline) = pipeline_by_submission.get(&submission_id) {
+            statuses.push(submission_status_from_pipeline(pipeline));
         }
     }
 
@@ -14903,6 +14978,161 @@ async fn submission_status_handler(
     .await
     .map_err(internal_error)?;
     Ok(Json(statuses))
+}
+
+fn pipeline_status_for_protocol(status: &PipelineContributorStatus) -> TracePipelineStatusUpdate {
+    let enum_label = |value: serde_json::Value| value.as_str().unwrap_or("unknown").to_string();
+    TracePipelineStatusUpdate {
+        run_id: status.run_id,
+        bundle_id: status.bundle_id.clone(),
+        processing_state: enum_label(
+            serde_json::to_value(status.processing).unwrap_or(serde_json::Value::Null),
+        ),
+        current_phase: status.current_phase.map(|phase| {
+            enum_label(serde_json::to_value(phase).unwrap_or(serde_json::Value::Null))
+        }),
+        responsible_phase: status.responsible_phase.map(|phase| {
+            enum_label(serde_json::to_value(phase).unwrap_or(serde_json::Value::Null))
+        }),
+        reason_label: status.reason_label.clone(),
+        instruments: status
+            .instruments
+            .iter()
+            .map(|instrument| TraceInstrumentStatusUpdate {
+                instrument_id: instrument.instrument_id.clone(),
+                atomic_units: instrument.atomic_units,
+                operation_state: instrument.operation_state.clone(),
+                internal_settlement_state: instrument.internal_settlement_state.clone(),
+                payout_rail: instrument.payout_rail.clone(),
+                payout_state: instrument.payout_state.clone(),
+                reason_label: instrument.reason_label.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn submission_status_from_pipeline(
+    status: &PipelineContributorStatus,
+) -> TraceSubmissionStatusUpdate {
+    let trace_credit_points = status
+        .instruments
+        .iter()
+        .find(|instrument| instrument.instrument_id == "trace_credit")
+        .map(|instrument| instrument.atomic_units as f32 / 1_000_000.0)
+        .unwrap_or_default();
+    let processing = serde_json::to_value(status.processing)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    TraceSubmissionStatusUpdate {
+        submission_id: status.submission_id,
+        trace_id: status.trace_id,
+        status: processing,
+        credit_points_pending: trace_credit_points,
+        credit_points_final: (status.credit
+            == trace_commons_server::versioned_pipeline_product::PipelineCreditStatus::Finalized)
+            .then_some(trace_credit_points),
+        credit_points_ledger: trace_credit_points,
+        credit_points_total: Some(trace_credit_points),
+        explanation: Vec::new(),
+        delayed_credit_explanations: Vec::new(),
+        consent_scopes: Vec::new(),
+        pipeline: Some(pipeline_status_for_protocol(status)),
+    }
+}
+
+#[cfg(test)]
+mod pipeline_product_api_tests {
+    use super::*;
+    use trace_commons_server::versioned_pipeline_product::{
+        PipelineCreditStatus, PipelineInstrumentStatus, PipelineProcessingStatus,
+    };
+
+    #[test]
+    fn pipeline_status_protocol_projection_keeps_instrument_states_separate_and_hash_only() {
+        let status = PipelineContributorStatus {
+            submission_id: Uuid::new_v4(),
+            trace_id: Uuid::new_v4(),
+            run_id: Uuid::new_v4(),
+            bundle_id: format!("sha256:{}", "a".repeat(64)),
+            processing: PipelineProcessingStatus::Complete,
+            current_phase: None,
+            responsible_phase: Some(trace_commons_gate_api::pipeline::Phase::Settle),
+            reason_label: None,
+            credit: PipelineCreditStatus::Finalized,
+            score_microcredits: Some(42),
+            score_outcome_id: Some(Uuid::new_v4()),
+            settlement_batch_id: Some(Uuid::new_v4()),
+            payout: Some("confirmed".to_string()),
+            instruments: vec![
+                PipelineInstrumentStatus {
+                    instrument_id: "storage_rebate".to_string(),
+                    atomic_units: 7,
+                    operation_state: "complete".to_string(),
+                    internal_settlement_state: "not_applicable".to_string(),
+                    credit_event_id: None,
+                    settlement_batch_id: None,
+                    payout_rail: "none".to_string(),
+                    payout_state: "disabled".to_string(),
+                    reason_label: None,
+                },
+                PipelineInstrumentStatus {
+                    instrument_id: "trace_credit".to_string(),
+                    atomic_units: 42,
+                    operation_state: "complete".to_string(),
+                    internal_settlement_state: "finalized".to_string(),
+                    credit_event_id: Some(Uuid::new_v4()),
+                    settlement_batch_id: Some(Uuid::new_v4()),
+                    payout_rail: "near".to_string(),
+                    payout_state: "confirmed".to_string(),
+                    reason_label: None,
+                },
+            ],
+        };
+        let projected = submission_status_from_pipeline(&status);
+        let pipeline = projected.pipeline.unwrap();
+        assert_eq!(pipeline.instruments.len(), 2);
+        assert_eq!(
+            pipeline.instruments[0].internal_settlement_state,
+            "not_applicable"
+        );
+        assert_eq!(pipeline.instruments[1].payout_state, "confirmed");
+        let json = serde_json::to_string(&pipeline).unwrap();
+        assert!(!json.contains("account"));
+        assert!(!json.contains("transaction"));
+        assert!(!json.contains("principal"));
+    }
+
+    #[test]
+    fn legacy_and_pipeline_status_documents_remain_wire_compatible() {
+        let legacy_json = serde_json::json!({
+            "submission_id": Uuid::new_v4(),
+            "trace_id": Uuid::new_v4(),
+            "status": "accepted",
+            "credit_points_pending": 0.0,
+            "credit_points_ledger": 0.0,
+            "explanation": [],
+            "delayed_credit_explanations": [],
+            "consent_scopes": []
+        });
+        let legacy: TraceSubmissionStatusUpdate =
+            serde_json::from_value(legacy_json).expect("legacy status remains readable");
+        assert!(legacy.pipeline.is_none());
+
+        let mut upgraded = legacy.clone();
+        upgraded.pipeline = Some(TracePipelineStatusUpdate {
+            run_id: Uuid::new_v4(),
+            bundle_id: format!("sha256:{}", "b".repeat(64)),
+            processing_state: "pending".to_string(),
+            current_phase: Some("review".to_string()),
+            responsible_phase: Some("admission".to_string()),
+            reason_label: None,
+            instruments: Vec::new(),
+        });
+        let mixed = serde_json::to_value(vec![legacy, upgraded]).unwrap();
+        assert!(mixed[0].get("pipeline").is_none());
+        assert_eq!(mixed[1]["pipeline"]["processing_state"], "pending");
+    }
 }
 
 /// Cap on submissions bundled into a single score attestation, mirroring the
@@ -15041,6 +15271,186 @@ async fn score_attestation_handler(
     .await
     .map_err(internal_error)?;
     Ok(Json(ScoreAttestationResponse { attestation: token }))
+}
+
+async fn pipeline_score_attestation_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<ScoreAttestationResponse>> {
+    let tenant = authenticate_ctx_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    let signer = state.attestation_signing.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            trace_commons_server::trace_score_attestation::ATTESTATION_SIGNING_KEY_UNCONFIGURED,
+        )
+    })?;
+    let product = state.pipeline_product.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline score attestation requires a configured PostgreSQL mirror",
+        )
+    })?;
+    let submissions = product
+        .own_score_attestation_entries(tenant.tenant_id(), tenant.principal_ref())
+        .await
+        .map_err(internal_error)?;
+    let item_count = submissions.len();
+    let token = sign_versioned_score_attestation(
+        signer,
+        tenant.tenant_id(),
+        tenant.principal_ref(),
+        submissions,
+        Utc::now(),
+    )
+    .map_err(internal_error)?;
+    append_control_plane_read_audit(
+        state.as_ref(),
+        tenant.auth(),
+        "pipeline_score_attestation",
+        item_count,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(ScoreAttestationResponse { attestation: token }))
+}
+
+async fn pipeline_withdrawal_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(submission_id): AxumPath<Uuid>,
+) -> ApiResult<Json<trace_commons_server::versioned_pipeline::PipelineWithdrawalOutcome>> {
+    let tenant = authenticate_ctx_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    let product = state.pipeline_product.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline withdrawal requires a configured PostgreSQL mirror",
+        )
+    })?;
+    match product
+        .withdraw_submission(tenant.tenant_id(), submission_id, tenant.principal_ref())
+        .await
+    {
+        Ok(outcome) => Ok(Json(outcome)),
+        Err(DatabaseError::NotFound { .. }) => {
+            Err(api_error(StatusCode::NOT_FOUND, "submission_not_found"))
+        }
+        Err(error) => {
+            let error_hash = format!("sha256:{:x}", Sha256::digest(error.to_string().as_bytes()));
+            tracing::warn!(
+                %error_hash,
+                "pipeline withdrawal failed"
+            );
+            Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "pipeline_withdrawal_unavailable",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineExportRequest {
+    allowed_use: String,
+    purpose: String,
+    #[serde(default = "default_pipeline_export_limit")]
+    limit: usize,
+}
+
+const fn default_pipeline_export_limit() -> usize {
+    trace_commons_server::versioned_pipeline_product::PIPELINE_EXPORT_ITEM_MAX
+}
+
+async fn create_pipeline_export_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<PipelineExportRequest>,
+) -> ApiResult<Json<PipelineExportSnapshot>> {
+    let tenant = authenticate_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    require_export_worker_operator(&tenant)?;
+    let product = state.pipeline_product.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline export requires a configured PostgreSQL mirror",
+        )
+    })?;
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "idempotency key is required"))?;
+    let snapshot = product
+        .create_export_snapshot(
+            &tenant.tenant_id,
+            &tenant.principal_ref,
+            &product_sha256_prefixed(idempotency_key.as_bytes()),
+            &body.allowed_use,
+            &product_sha256_prefixed(body.purpose.as_bytes()),
+            body.limit,
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(snapshot))
+}
+
+async fn complete_pipeline_export_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(snapshot_id): AxumPath<Uuid>,
+) -> ApiResult<Json<PipelineExportSnapshot>> {
+    let tenant = authenticate_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    require_export_worker_operator(&tenant)?;
+    let product = state.pipeline_product.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline export requires a configured PostgreSQL mirror",
+        )
+    })?;
+    let snapshot = product
+        .complete_export_snapshot(&tenant.tenant_id, &tenant.principal_ref, snapshot_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(snapshot))
+}
+
+async fn pipeline_operational_summary_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<PipelineOperationalSummary>> {
+    let tenant = authenticate_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    require_admin(&tenant)?;
+    let product = state.pipeline_product.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline operations require a configured PostgreSQL mirror",
+        )
+    })?;
+    Ok(Json(
+        product
+            .operational_summary(&tenant.tenant_id)
+            .await
+            .map_err(internal_error)?,
+    ))
+}
+
+async fn pipeline_forensic_trace_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(run_id): AxumPath<Uuid>,
+) -> ApiResult<Json<PipelineForensicTrace>> {
+    let tenant = authenticate_with_tenant_access_grant(state.as_ref(), &headers).await?;
+    require_admin(&tenant)?;
+    let product = state.pipeline_product.as_ref().ok_or_else(|| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline operations require a configured PostgreSQL mirror",
+        )
+    })?;
+    let trace = product
+        .forensic_trace(&tenant.tenant_id, run_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "pipeline run not found"))?;
+    Ok(Json(trace))
 }
 
 /// `POST /v1/contributors/me/score-attestation` — the SCOPED form: attests
@@ -57524,6 +57934,7 @@ fn submission_status_from_record(
         explanation: receipt.explanation,
         delayed_credit_explanations,
         consent_scopes: record.consent_scopes.clone(),
+        pipeline: None,
     }
 }
 

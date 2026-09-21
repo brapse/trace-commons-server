@@ -24,7 +24,7 @@ use trace_commons_server::trace_corpus_storage::TraceCorpusStore;
 use trace_commons_server::versioned_pipeline::{
     MinimalPolicyBundle, PipelineCaps, PipelineCrashPoint, PipelineInstrumentAwardConfig,
     PipelinePayoutConfig, PipelineReceiptResult, PipelineRunState, PipelineService,
-    PipelineServiceBuilder,
+    PipelineServiceBuilder, PipelineWithdrawalFollowUpState,
 };
 use trace_commons_server::versioned_pipeline_authority::{
     ClassifierRedactorPipelinePrivacyBoundary, StaticPipelineAuthorityProvider,
@@ -35,7 +35,13 @@ use trace_commons_server::versioned_pipeline_compat::{
 use trace_commons_server::versioned_pipeline_credit::{
     RecordingNearAdapter, RecordingSettlementAdapter, SettlementAdapterRegistry,
 };
-use trace_commons_server::versioned_pipeline_index::{IsolatedPipelineIndex, PIPELINE_INDEX_ID};
+use trace_commons_server::versioned_pipeline_index::{
+    IndexFault, IsolatedPipelineIndex, PIPELINE_INDEX_ID,
+};
+use trace_commons_server::versioned_pipeline_product::{
+    PIPELINE_STATUS_BATCH_MAX, PipelineCreditStatus, PipelineProcessingStatus,
+    PipelineProductStore, sha256_prefixed,
+};
 use uuid::Uuid;
 
 static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -560,6 +566,42 @@ async fn multi_instrument_failure_retry_and_crash_are_independent_and_authoritat
     finish_run(&service, &tenant, created.run_id).await;
     assert_eq!(trace.requests().len(), 1);
     assert_eq!(rebate.requests().len(), 1);
+    let status = PipelineProductStore::new(backend.clone())
+        .contributor_statuses(&tenant, "principal_sha256:test", &[created.submission_id])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(status.processing, PipelineProcessingStatus::Complete);
+    assert_eq!(status.credit, PipelineCreditStatus::Finalized);
+    assert_eq!(status.instruments.len(), 2);
+    let trace_credit = status
+        .instruments
+        .iter()
+        .find(|instrument| instrument.instrument_id == "trace_credit")
+        .unwrap();
+    assert_eq!(trace_credit.operation_state, "complete");
+    assert_eq!(trace_credit.internal_settlement_state, "finalized");
+    assert_eq!(trace_credit.payout_state, "pending");
+    let rebate_status = status
+        .instruments
+        .iter()
+        .find(|instrument| instrument.instrument_id == "storage_rebate")
+        .unwrap();
+    assert_eq!(rebate_status.operation_state, "complete");
+    assert_eq!(rebate_status.internal_settlement_state, "not_applicable");
+    assert_eq!(rebate_status.payout_state, "disabled");
+    assert!(
+        PipelineProductStore::new(backend.clone())
+            .contributor_statuses(
+                &format!("{tenant}-other"),
+                "principal_sha256:test",
+                &[created.submission_id],
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     let inspection = service
         .inspect(&tenant, created.run_id)
@@ -735,4 +777,334 @@ async fn crash_reuses_completed_operations_and_payout_waits_for_confirmation_evi
         .pop()
         .unwrap();
     assert_eq!(settlement.payout_state, "confirmed");
+}
+
+#[tokio::test]
+async fn contributor_status_pagination_is_bounded_and_stable() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let service =
+        PipelineService::new_test_only(backend.clone(), artifact_store(&root), None).unwrap();
+    let tenant = format!("pipeline-status-page-{}", Uuid::new_v4());
+    let principal = "principal_sha256:status-page";
+    for index in 0..3 {
+        let result = service
+            .submit(
+                &tenant,
+                principal,
+                &format!("page-{index}"),
+                &envelope_bytes(Uuid::new_v4()).await,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, PipelineReceiptResult::Created(_)));
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+
+    let product = PipelineProductStore::new(backend.clone());
+    let first = product
+        .own_contributor_statuses_page(&tenant, principal, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 2);
+    assert!(
+        product
+            .own_contributor_statuses_page(&tenant, principal, None, 0)
+            .await
+            .is_err()
+    );
+    assert!(
+        product
+            .own_contributor_statuses_page(&tenant, principal, None, PIPELINE_STATUS_BATCH_MAX + 1,)
+            .await
+            .is_err()
+    );
+
+    let mut client = backend.trace_pool_for_test().get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.execute(
+        "SELECT set_config('trace_commons.trace_tenant_id', $1, true)",
+        &[&tenant],
+    )
+    .await
+    .unwrap();
+    let cursor = tx
+        .query_one(
+            "SELECT received_at, submission_id
+               FROM trace_submissions
+              WHERE tenant_id = $1 AND submission_id = $2",
+            &[&tenant, &first[1].submission_id],
+        )
+        .await
+        .unwrap();
+    let after = Some((cursor.get("received_at"), cursor.get("submission_id")));
+    tx.commit().await.unwrap();
+
+    let second = product
+        .own_contributor_statuses_page(&tenant, principal, after, 2)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_ne!(second[0].submission_id, first[0].submission_id);
+    assert_ne!(second[0].submission_id, first[1].submission_id);
+}
+
+#[tokio::test]
+async fn withdrawal_commits_tombstone_propagation_audit_and_export_invalidation_atomically() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let service = production_service(
+        backend.clone(),
+        artifact_store(&root),
+        MinimalPolicyBundle::build_operations(1_000_000, false).unwrap(),
+        vec![RecordingSettlementAdapter::new(
+            InstrumentId::trace_credit(),
+            "withdrawal-trace-credit-test",
+            "none",
+        )],
+        BTreeMap::from([("trace_credit".to_string(), 2_000_000)]),
+        Arc::new(RecordingNearAdapter::new()),
+        false,
+        None,
+    );
+    let tenant = format!("pipeline-withdrawal-{}", Uuid::new_v4());
+    let principal = "principal_sha256:withdrawal-owner";
+    let submission_id = Uuid::new_v4();
+    let mut envelope: TraceContributionEnvelope =
+        serde_json::from_slice(&envelope_bytes(submission_id).await).unwrap();
+    if !envelope
+        .trace_card
+        .allowed_uses
+        .contains(&trace_commons_protocol::trace_contribution::TraceAllowedUse::Evaluation)
+    {
+        envelope
+            .trace_card
+            .allowed_uses
+            .push(trace_commons_protocol::trace_contribution::TraceAllowedUse::Evaluation);
+    }
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let PipelineReceiptResult::Created(created) = service
+        .submit(&tenant, principal, "withdrawal", &bytes)
+        .await
+        .unwrap()
+    else {
+        panic!("receipt must create a run");
+    };
+    finish_run(&service, &tenant, created.run_id).await;
+
+    let product = PipelineProductStore::new(backend.clone());
+    let snapshot = product
+        .create_export_snapshot(
+            &tenant,
+            "exporter_sha256:managed",
+            &sha256_prefixed(b"withdrawal-export-request"),
+            "evaluation",
+            &sha256_prefixed(b"withdrawal-export-purpose"),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.items.len(), 1);
+    let completed = product
+        .complete_export_snapshot(&tenant, "exporter_sha256:managed", snapshot.snapshot_id)
+        .await
+        .unwrap();
+    assert_eq!(completed.state, "complete");
+
+    let before_events = backend.list_trace_credit_events(&tenant).await.unwrap();
+    assert_eq!(before_events.len(), 1);
+    let outcome = service
+        .withdraw_submission(&tenant, created.submission_id, principal)
+        .await
+        .unwrap();
+    assert_eq!(outcome.withdrawal.distribution_reach, "commons_distributed");
+    assert_eq!(
+        outcome.revocation_propagation,
+        PipelineWithdrawalFollowUpState::Pending
+    );
+    assert!(matches!(
+        outcome.index_invalidation,
+        PipelineWithdrawalFollowUpState::Pending | PipelineWithdrawalFollowUpState::NotRequired
+    ));
+
+    let mut client = backend.trace_pool_for_test().get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.execute(
+        "SELECT set_config('trace_commons.trace_tenant_id', $1, true)",
+        &[&tenant],
+    )
+    .await
+    .unwrap();
+    let evidence = tx
+        .query_one(
+            "SELECT
+                (SELECT COUNT(*) FROM trace_withdrawals
+                  WHERE tenant_id = $1 AND submission_id = $2) AS withdrawals,
+                (SELECT COUNT(*) FROM trace_tombstones
+                  WHERE tenant_id = $1 AND submission_id = $2) AS tombstones,
+                (SELECT COUNT(*) FROM trace_revocation_propagation_items
+                  WHERE tenant_id = $1 AND source_submission_id = $2
+                    AND status = 'pending') AS propagation,
+                (SELECT COUNT(*) FROM trace_audit_events
+                  WHERE tenant_id = $1 AND submission_id = $2
+                    AND action = 'revoke') AS audits,
+                (SELECT COUNT(*) FROM pipeline_export_snapshots
+                  WHERE tenant_id = $1 AND snapshot_id = $3
+                    AND state = 'invalidated') AS invalidated_exports",
+            &[&tenant, &created.submission_id, &snapshot.snapshot_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(evidence.get::<_, i64>("withdrawals"), 1);
+    assert_eq!(evidence.get::<_, i64>("tombstones"), 1);
+    assert!(evidence.get::<_, i64>("propagation") > 0);
+    assert_eq!(evidence.get::<_, i64>("audits"), 1);
+    assert_eq!(evidence.get::<_, i64>("invalidated_exports"), 1);
+    let audit = tx
+        .query_one(
+            "SELECT reason, decision_inputs_hash, metadata_json, canonical_event_json
+               FROM trace_audit_events
+              WHERE tenant_id = $1 AND submission_id = $2 AND action = 'revoke'",
+            &[&tenant, &created.submission_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.get::<_, String>("reason"), "pipeline_withdrawal");
+    assert!(
+        audit
+            .get::<_, String>("decision_inputs_hash")
+            .starts_with("sha256:")
+    );
+    let metadata = audit.get::<_, serde_json::Value>("metadata_json");
+    assert!(
+        metadata["reason_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+    assert!(
+        audit
+            .get::<_, Option<String>>("canonical_event_json")
+            .is_none()
+    );
+    tx.commit().await.unwrap();
+
+    let after_events = backend.list_trace_credit_events(&tenant).await.unwrap();
+    assert_eq!(
+        after_events, before_events,
+        "withdrawal must not claw back credit"
+    );
+    let status = product
+        .contributor_statuses(&tenant, principal, &[created.submission_id])
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(status.processing, PipelineProcessingStatus::Withdrawn);
+    assert_eq!(status.credit, PipelineCreditStatus::Finalized);
+
+    let replay = service
+        .withdraw_submission(&tenant, created.submission_id, principal)
+        .await
+        .unwrap();
+    assert_eq!(replay.withdrawal, outcome.withdrawal);
+    let missing = service
+        .withdraw_submission(&tenant, Uuid::new_v4(), principal)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        missing,
+        trace_commons_server::error::DatabaseError::NotFound { .. }
+    ));
+}
+
+#[tokio::test]
+async fn durable_withdrawal_reports_index_propagation_failures_without_becoming_not_found() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let index = IsolatedPipelineIndex::new();
+    let service = PipelineServiceBuilder::production(
+        backend,
+        artifact_store(&root),
+        MinimalPolicyBundle::build_operations(0, true).unwrap(),
+        Arc::new(ReferencePerplexityScorer::new()),
+        Arc::new(ReferenceEmbedder::new()),
+        index.clone(),
+        index.clone(),
+        SettlementAdapterRegistry::new(Vec::new()).unwrap(),
+        Arc::new(RecordingNearAdapter::new()),
+        Arc::new(StaticPipelineAuthorityProvider::test_only(
+            SubmissionAuthority {
+                tenant: SubmissionAllowlists::default(),
+                policy: None,
+                require_policy: false,
+            },
+        )),
+        Arc::new(
+            ClassifierRedactorPipelinePrivacyBoundary::new(
+                Arc::new(NoopPrivacyFilterAdapter),
+                PiiClassifyPolicy::AllEvents,
+                "noop_classifier_redactor_test_only",
+            )
+            .unwrap(),
+        ),
+        PipelineCaps {
+            per_instrument_atomic_units: BTreeMap::new(),
+        },
+        PipelinePayoutConfig {
+            enabled: false,
+            require_confirmation_evidence: true,
+        },
+    )
+    .build()
+    .unwrap();
+    let tenant = format!("pipeline-invalidation-report-{}", Uuid::new_v4());
+    let principal = "principal_sha256:invalidation-owner";
+    let PipelineReceiptResult::Created(created) = service
+        .submit(
+            &tenant,
+            principal,
+            "invalidation-report",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("receipt must create");
+    };
+    finish_run(&service, &tenant, created.run_id).await;
+    let withdrawal = service
+        .withdraw_submission(&tenant, created.submission_id, principal)
+        .await
+        .unwrap();
+    assert_eq!(
+        withdrawal.index_invalidation,
+        PipelineWithdrawalFollowUpState::Pending
+    );
+
+    for expected in ["pending", "pending", "pending", "pending", "failed"] {
+        index.set_fault(IndexFault::FailInvalidation);
+        let run = service
+            .process_index_invalidation(&tenant, created.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.index_invalidation_state, expected);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    }
+    let replay = service
+        .withdraw_submission(&tenant, created.submission_id, principal)
+        .await
+        .unwrap();
+    assert_eq!(replay.withdrawal, withdrawal.withdrawal);
+    assert_eq!(
+        replay.index_invalidation,
+        PipelineWithdrawalFollowUpState::Failed
+    );
 }

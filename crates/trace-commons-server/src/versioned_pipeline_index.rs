@@ -26,6 +26,7 @@ pub enum IndexFault {
     None,
     FailBeforeApply,
     LostAfterApply,
+    FailInvalidation,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +87,28 @@ impl IsolatedPipelineIndex {
                     && entry.revision_id == revision_id
             },
         )
+    }
+
+    pub fn try_invalidate_revision(
+        &self,
+        tenant_id: &str,
+        index_id: &str,
+        revision_id: Uuid,
+    ) -> Result<bool, IndexWriteError> {
+        let mut state = self.state.lock().expect("index mutex");
+        if state.fault == IndexFault::FailInvalidation {
+            state.fault = IndexFault::None;
+            return Err(IndexWriteError::Failed);
+        }
+        let before = state.entries.len();
+        state
+            .entries
+            .retain(|(stored_tenant, stored_index, _), entry| {
+                stored_tenant != tenant_id
+                    || stored_index != index_id
+                    || entry.revision_id != revision_id
+            });
+        Ok(state.entries.len() != before)
     }
 }
 
@@ -161,7 +184,7 @@ impl VectorIndexWriter for IsolatedPipelineIndex {
                 state.fault = IndexFault::None;
                 return Err(IndexWriteError::Failed);
             }
-            IndexFault::LostAfterApply | IndexFault::None => {}
+            IndexFault::LostAfterApply | IndexFault::FailInvalidation | IndexFault::None => {}
         }
         let map_key = (key.tenant_id.clone(), key.index_id.clone(), key.entry_id());
         let digest = IndexEntryKey::content_digest(embedding, content_hash);
