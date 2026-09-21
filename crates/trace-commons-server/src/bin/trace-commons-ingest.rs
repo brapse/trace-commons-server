@@ -1166,7 +1166,7 @@ fn default_trace_ranking_joined_evidence_hash() -> String {
 
 /// Printed by `--generate-attestation-keypair`.
 ///
-/// Deliberately handled before `AppState::from_env()`: an operator needs this
+/// Deliberately handled before `AppState` loads configuration: an operator needs this
 /// key in order to configure the server, so requiring a configured server to
 /// mint it would be circular. This path touches no env var, no database, and
 /// no object store.
@@ -1222,6 +1222,20 @@ SUBCOMMANDS:
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    run_ingest(None).await
+}
+
+/// Starts ingest with an optional production pipeline assembly.
+///
+/// The repository build deliberately passes `None`: proprietary scorer,
+/// index, settlement, and payout implementations do not live in this tree.
+/// A production distribution must pass an assembler and set
+/// `TRACE_COMMONS_PIPELINE_RUNTIME_REQUIRED=true`. Startup then fails closed
+/// if assembly is absent or an injected dependency is not production
+/// qualified.
+pub async fn run_ingest(
+    pipeline_runtime_assembler: Option<&dyn IngestPipelineRuntimeAssembler>,
+) -> anyhow::Result<()> {
     // Choose the rustls crypto provider before anything can open a TLS
     // connection.
     //
@@ -1306,7 +1320,9 @@ async fn main() -> anyhow::Result<()> {
         policy = PiiClassifyPolicy::from_env().as_label(),
         "Trace Commons PII classify policy"
     );
-    let state = Arc::new(AppState::from_env().await?);
+    let state = Arc::new(
+        AppState::from_env_with_pipeline_runtime_assembler(pipeline_runtime_assembler).await?,
+    );
     validate_trace_export_job_scheduler_config(state.as_ref(), state.export_job_scheduler.as_ref())
         .await?;
     validate_trace_near_credit_outbox_scheduler_config(
@@ -1566,6 +1582,7 @@ struct AppState {
     db_mirror: Option<Arc<dyn Database>>,
     pipeline_activation: Option<PipelineActivationStore>,
     pipeline_service: Option<Arc<PipelineService>>,
+    pipeline_runtime_required: bool,
     pipeline_product: Option<PipelineProductStore>,
     db_contributor_reads: bool,
     db_reviewer_reads: bool,
@@ -1861,6 +1878,20 @@ struct AppState {
     #[cfg(test)]
     near_access_key_checker_override:
         Option<Arc<dyn trace_commons_server::account_near::NearAccessKeyChecker>>,
+}
+
+pub struct IngestPipelineRuntimeContext {
+    pub backend: Arc<PgBackend>,
+    pub artifact_store: Arc<dyn TraceArtifactStore>,
+}
+
+/// Compile-time injection seam for a proprietary production pipeline
+/// assembly. The stock binary intentionally has no implementation.
+pub trait IngestPipelineRuntimeAssembler: Send + Sync {
+    fn assemble(
+        &self,
+        context: IngestPipelineRuntimeContext,
+    ) -> anyhow::Result<Arc<PipelineService>>;
 }
 
 #[derive(Clone)]
@@ -3508,7 +3539,9 @@ impl AppState {
         )
     }
 
-    async fn from_env() -> anyhow::Result<Self> {
+    async fn from_env_with_pipeline_runtime_assembler(
+        pipeline_runtime_assembler: Option<&dyn IngestPipelineRuntimeAssembler>,
+    ) -> anyhow::Result<Self> {
         let root = std::env::var("TRACE_COMMONS_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_data_dir());
@@ -3715,6 +3748,13 @@ impl AppState {
         let submission_quota = parse_submission_quota_config_from_env()?;
         let legal_hold_retention_policy_ids = parse_legal_hold_retention_policy_ids_from_env()?;
         let artifact_store = trace_artifact_store_from_env(&root).await?;
+        let pipeline_runtime_required = env_truthy("TRACE_COMMONS_PIPELINE_RUNTIME_REQUIRED");
+        let pipeline_service = assemble_ingest_pipeline_runtime(
+            pipeline_runtime_assembler,
+            db_connections.as_ref(),
+            artifact_store.as_ref(),
+            pipeline_runtime_required,
+        )?;
         let require_object_store_versioning =
             env_truthy(TRACE_COMMONS_OBJECT_STORE_REQUIRE_VERSIONING);
         validate_required_object_store_versioning_config(
@@ -4147,7 +4187,8 @@ impl AppState {
             require_tenant_submission_policy,
             db_mirror,
             pipeline_activation,
-            pipeline_service: None,
+            pipeline_service,
+            pipeline_runtime_required,
             pipeline_product,
             db_contributor_reads,
             db_reviewer_reads,
@@ -4428,6 +4469,54 @@ fn validate_required_object_store_versioning_config(
         store.restore_after_delete_supported()
     );
     Ok(())
+}
+
+fn assemble_ingest_pipeline_runtime(
+    assembler: Option<&dyn IngestPipelineRuntimeAssembler>,
+    db_connections: Option<&TraceCorpusDbConnections>,
+    artifact_store: Option<&ConfiguredTraceArtifactStore>,
+    production_required: bool,
+) -> anyhow::Result<Option<Arc<PipelineService>>> {
+    let Some(assembler) = assembler else {
+        anyhow::ensure!(
+            !production_required,
+            "pipeline_runtime_required_but_not_injected"
+        );
+        return Ok(None);
+    };
+    let backend = db_connections
+        .map(|connections| connections.postgres.clone())
+        .ok_or_else(|| anyhow::anyhow!("pipeline_runtime_database_unavailable"))?;
+    let artifact_store = artifact_store
+        .map(|configured| configured.store.clone())
+        .ok_or_else(|| anyhow::anyhow!("pipeline_runtime_artifact_store_unavailable"))?;
+    let service = assembler.assemble(IngestPipelineRuntimeContext {
+        backend,
+        artifact_store,
+    })?;
+    if production_required {
+        anyhow::ensure!(
+            pipeline_runtime_is_production_qualified(&service),
+            "pipeline_runtime_dependencies_not_production_qualified"
+        );
+    }
+    Ok(Some(service))
+}
+
+fn pipeline_runtime_is_production_qualified(service: &PipelineService) -> bool {
+    let qualification = service.dependency_qualification();
+    qualification.authority
+        && qualification.privacy
+        && qualification.scorer
+        && qualification.embedder
+        && qualification.index_reader
+        && qualification.index_writer
+        && !qualification.settlement_adapters.is_empty()
+        && qualification
+            .settlement_adapters
+            .values()
+            .all(|ready| *ready)
+        && qualification.payout_adapter
 }
 
 fn enforce_db_mirror_write_result(
@@ -11815,6 +11904,10 @@ struct TraceCommonsObjectStoreConfigStatus {
 struct TraceCommonsConfigStatusResponse {
     schema_version: &'static str,
     db_mirror_configured: bool,
+    pipeline_activation_store_configured: bool,
+    pipeline_runtime_configured: bool,
+    pipeline_runtime_required: bool,
+    pipeline_runtime_production_qualified: bool,
     signed_token_auth_enabled: bool,
     signed_token_key_count: usize,
     signed_token_eddsa_key_count: usize,
@@ -12076,6 +12169,13 @@ fn trace_commons_config_status_response(state: &AppState) -> TraceCommonsConfigS
     TraceCommonsConfigStatusResponse {
         schema_version: TRACE_CONTRIBUTION_SCHEMA_VERSION,
         db_mirror_configured: state.db_mirror.is_some(),
+        pipeline_activation_store_configured: state.pipeline_activation.is_some(),
+        pipeline_runtime_configured: state.pipeline_service.is_some(),
+        pipeline_runtime_required: state.pipeline_runtime_required,
+        pipeline_runtime_production_qualified: state
+            .pipeline_service
+            .as_deref()
+            .is_some_and(pipeline_runtime_is_production_qualified),
         signed_token_auth_enabled: state.signed_token_verifier.is_some(),
         signed_token_key_count: signed_token_verifier
             .as_ref()

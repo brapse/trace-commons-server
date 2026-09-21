@@ -206,6 +206,32 @@ async fn cleanup_pg_trace_tenant(backend: &PgBackend, tenant_id: &str) {
     tx.commit().await.expect("commit cleanup transaction");
 }
 
+struct TestIngestPipelineRuntimeAssembler;
+
+impl IngestPipelineRuntimeAssembler for TestIngestPipelineRuntimeAssembler {
+    fn assemble(
+        &self,
+        context: IngestPipelineRuntimeContext,
+    ) -> anyhow::Result<Arc<PipelineService>> {
+        Ok(Arc::new(PipelineService::new_test_only(
+            context.backend,
+            context.artifact_store,
+            None,
+        )?))
+    }
+}
+
+#[test]
+fn required_ingest_pipeline_runtime_fails_closed_without_assembly() {
+    let error = assemble_ingest_pipeline_runtime(None, None, None, true)
+        .err()
+        .expect("required runtime must reject the stock unassembled binary");
+    assert_eq!(
+        error.to_string(),
+        "pipeline_runtime_required_but_not_injected"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_ingest_pipeline_activation_routes_mixed_receipts_and_replays() {
     let Some(backend) = postgres_backend_for_ingest_test().await else {
@@ -220,11 +246,33 @@ async fn real_ingest_pipeline_activation_routes_mixed_receipts_and_replays() {
         ))
         .expect("artifact crypto"),
     ));
-    let service = Arc::new(
-        PipelineService::new_test_only(backend.clone(), artifacts.clone(), None)
-            .expect("pipeline service"),
-    );
     let database: Arc<dyn Database> = backend.clone();
+    let db_connections = TraceCorpusDbConnections {
+        database: database.clone(),
+        postgres: backend.clone(),
+    };
+    let configured_artifacts =
+        ConfiguredTraceArtifactStore::new("test_pipeline_runtime", artifacts.clone());
+    let production_error = assemble_ingest_pipeline_runtime(
+        Some(&TestIngestPipelineRuntimeAssembler),
+        Some(&db_connections),
+        Some(&configured_artifacts),
+        true,
+    )
+    .err()
+    .expect("test dependencies cannot satisfy production assembly");
+    assert_eq!(
+        production_error.to_string(),
+        "pipeline_runtime_dependencies_not_production_qualified"
+    );
+    let service = assemble_ingest_pipeline_runtime(
+        Some(&TestIngestPipelineRuntimeAssembler),
+        Some(&db_connections),
+        Some(&configured_artifacts),
+        false,
+    )
+    .expect("assemble injected pipeline runtime")
+    .expect("pipeline runtime");
     let mut state = test_state_with_options(
         temp.path().to_path_buf(),
         Some(database),
@@ -237,6 +285,11 @@ async fn real_ingest_pipeline_activation_routes_mixed_receipts_and_replays() {
     let state_mut = Arc::make_mut(&mut state);
     state_mut.pipeline_activation = Some(PipelineActivationStore::new(backend.clone()));
     state_mut.pipeline_service = Some(service.clone());
+    let config_status = trace_commons_config_status_response(&state);
+    assert!(config_status.pipeline_activation_store_configured);
+    assert!(config_status.pipeline_runtime_configured);
+    assert!(!config_status.pipeline_runtime_required);
+    assert!(!config_status.pipeline_runtime_production_qualified);
 
     let mut legacy = sample_envelope().await;
     make_metadata_only_low_risk(&mut legacy);
@@ -5337,6 +5390,7 @@ fn test_state_with_configured_artifact_store_policies_export_guardrails_and_requ
         db_mirror,
         pipeline_activation: None,
         pipeline_service: None,
+        pipeline_runtime_required: false,
         pipeline_product: None,
         db_contributor_reads,
         db_reviewer_reads,
@@ -26290,6 +26344,7 @@ async fn maintenance_legal_hold_retention_policy_blocks_expiration_and_purge() {
         db_mirror: None,
         pipeline_activation: None,
         pipeline_service: None,
+        pipeline_runtime_required: false,
         pipeline_product: None,
         db_contributor_reads: false,
         db_reviewer_reads: false,

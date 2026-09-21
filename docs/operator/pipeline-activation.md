@@ -33,6 +33,18 @@ uses the stored owner. Reuse with different request bytes returns `409`.
 The ingest process must have the production pipeline runtime before a tenant
 uses pipeline routing. If the runtime is absent, the handler returns `503`.
 
+The stock `trace-commons-ingest` build does not contain proprietary production
+adapters and passes no runtime assembler. A production distribution must pass
+an `IngestPipelineRuntimeAssembler` to `run_ingest`. The assembler receives the
+configured PostgreSQL backend and encrypted artifact store and must construct
+`PipelineService` with `PipelineServiceBuilder::production`.
+
+Set `TRACE_COMMONS_PIPELINE_RUNTIME_REQUIRED=true` in that distribution.
+Startup fails if the assembler is absent, if PostgreSQL or encrypted artifact
+storage is absent, or if any injected authority, privacy, scorer, embedder,
+index, settlement, or payout adapter is not production-qualified. Do not
+activate a tenant with the stock build.
+
 Containment returns `503` for a new receipt. Existing runs keep their bound
 package and remain available to workers.
 
@@ -68,9 +80,12 @@ these PostgreSQL integration tests remain separate schema and recovery checks.
 The local switched route is an operator rehearsal surface. Production clients
 use `POST /v1/traces`.
 
-## Current completion
+## Remaining production blockers
 
-The redesign is complete for the contracts that are not deferred.
-`SCR-005` remains deferred until the external valuation protocol exists.
-New valuation rules use a later bundle through the same qualification and
-activation process.
+- Assemble the proprietary production adapters in a production distribution.
+- Produce fresh pinned Hugging Face and full promotion evidence.
+- Qualify and activate the production bundle for each tenant.
+- Define the external valuation protocol for deferred contract `SCR-005`.
+
+The repository build is an activation-capable, fail-closed integration build.
+It is not a production-ready pipeline runtime by itself.
