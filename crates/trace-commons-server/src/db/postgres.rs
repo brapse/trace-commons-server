@@ -9,6 +9,8 @@ use std::collections::HashSet;
 mod account_onboarding;
 #[path = "postgres_mission_catalog.rs"]
 mod mission_catalog;
+#[cfg(test)]
+mod pipeline_upgrade_tests;
 #[path = "postgres_public_run.rs"]
 mod public_run;
 #[path = "postgres_reward_participant.rs"]
@@ -214,6 +216,26 @@ pub const TRACE_COMMONS_RLS_TABLES: &[&str] = &[
     "trace_near_provisioned_devices",
     "trace_account_merge_proposals",
     "trace_community_withdrawal_evictions",
+    "pipeline_runs",
+    "phase_outcomes",
+    "pipeline_bundle_packages",
+    "pipeline_active_bundles",
+    "pipeline_bundle_policy_status",
+    "pipeline_receipt_artifacts",
+    "pipeline_run_settlements",
+    "pipeline_policy_interventions",
+    "pipeline_admission_usage",
+    "pipeline_review_claims",
+    "pipeline_review_assessments",
+    "pipeline_index_invalidations",
+    "pipeline_export_snapshots",
+    "pipeline_export_snapshot_items",
+    "pipeline_bundle_qualifications",
+    "pipeline_tenant_routing",
+    "pipeline_activation_events",
+    "pipeline_receipt_ownership",
+    "pipeline_legacy_owned_work",
+    "pipeline_legacy_writer_status",
     "trace_public_runs",
     "trace_reward_operators",
     "trace_reward_programs",
@@ -1337,6 +1359,41 @@ const MIGRATIONS: &[(i32, &str, &str)] = &[
         73,
         "trace_gate_decision_author_perplexity",
         include_str!("../../../../migrations/V73__trace_gate_decision_author_perplexity.sql"),
+    ),
+    (
+        74,
+        "versioned_pipeline",
+        include_str!("../../../../migrations/V74__versioned_pipeline.sql"),
+    ),
+    (
+        75,
+        "versioned_pipeline_durability",
+        include_str!("../../../../migrations/V75__versioned_pipeline_durability.sql"),
+    ),
+    (
+        76,
+        "versioned_pipeline_index_credit",
+        include_str!("../../../../migrations/V76__versioned_pipeline_index_credit.sql"),
+    ),
+    (
+        77,
+        "versioned_pipeline_authority_privacy",
+        include_str!("../../../../migrations/V77__versioned_pipeline_authority_privacy.sql"),
+    ),
+    (
+        78,
+        "versioned_pipeline_product_integration",
+        include_str!("../../../../migrations/V78__versioned_pipeline_product_integration.sql"),
+    ),
+    (
+        79,
+        "versioned_pipeline_qualification",
+        include_str!("../../../../migrations/V79__versioned_pipeline_qualification.sql"),
+    ),
+    (
+        80,
+        "versioned_pipeline_activation",
+        include_str!("../../../../migrations/V80__versioned_pipeline_activation.sql"),
     ),
 ];
 
@@ -6220,6 +6277,13 @@ mod tests {
         (54, 2),
         (55, 3),
         (56, 4),
+        (74, 2),
+        (75, 2),
+        (76, 2),
+        (77, 2),
+        (78, 2),
+        (79, 2),
+        (80, 2),
     ];
 
     /// Every `.sql` file in `migrations/`, as `(version, file_stem)`, read at
@@ -6554,6 +6618,82 @@ mod tests {
     }
 
     #[test]
+    fn versioned_pipeline_migration_shape_is_pinned() {
+        let base = include_str!("../../../../migrations/V74__versioned_pipeline.sql");
+        let durability =
+            include_str!("../../../../migrations/V75__versioned_pipeline_durability.sql");
+        let settlement =
+            include_str!("../../../../migrations/V76__versioned_pipeline_index_credit.sql");
+        let authority =
+            include_str!("../../../../migrations/V77__versioned_pipeline_authority_privacy.sql");
+        let product =
+            include_str!("../../../../migrations/V78__versioned_pipeline_product_integration.sql");
+        let qualification =
+            include_str!("../../../../migrations/V79__versioned_pipeline_qualification.sql");
+        let activation =
+            include_str!("../../../../migrations/V80__versioned_pipeline_activation.sql");
+
+        assert!(
+            base.contains("UNIQUE (tenant_id, request_idempotency_key)")
+                && base.contains("UNIQUE (tenant_id, run_id, phase)")
+                && base.contains("CREATE TRIGGER phase_outcomes_reject_update")
+                && base.contains("CREATE TRIGGER phase_outcomes_reject_delete"),
+            "base pipeline migration must pin request idempotency and immutable outcomes"
+        );
+        assert!(
+            durability.contains("pipeline_runs_lease_shape")
+                && durability.contains("pipeline_runs_attempt_limit")
+                && durability.contains("reject_pipeline_run_identity_mutation"),
+            "durability migration must pin fenced leases and immutable run identity"
+        );
+        for forbidden in [
+            "ADD COLUMN credit_event_id",
+            "ADD COLUMN credit_write_state",
+            "ADD COLUMN settlement_batch_id",
+            "ADD COLUMN payout_state",
+        ] {
+            assert!(
+                !settlement
+                    .split("CREATE TABLE pipeline_run_settlements")
+                    .next()
+                    .expect("settlement migration prefix")
+                    .contains(forbidden),
+                "pipeline_runs must not retain singleton settlement state: {forbidden}"
+            );
+        }
+        for required in [
+            "CREATE TABLE pipeline_run_settlements",
+            "PRIMARY KEY (tenant_id, run_id, instrument_id)",
+            "UNIQUE (tenant_id, operation_ref_hash)",
+            "pipeline_run_settlements_lease_shape",
+            "pipeline_run_settlements_attempt_limit",
+            "reject_pipeline_run_settlement_identity_mutation",
+            "ALTER TABLE pipeline_run_settlements FORCE ROW LEVEL SECURITY;",
+            "CREATE POLICY trace_corpus_tenant_isolation ON pipeline_run_settlements",
+            "ADD COLUMN instrument_id TEXT",
+        ] {
+            assert!(
+                settlement.contains(required),
+                "instrument settlement migration is missing `{required}`"
+            );
+        }
+        for migration in [
+            base,
+            durability,
+            settlement,
+            authority,
+            product,
+            qualification,
+            activation,
+        ] {
+            assert!(
+                !migration.contains("-- Phase "),
+                "durable migration comments must use behavior names, not delivery phases"
+            );
+        }
+    }
+
+    #[test]
     fn trace_commons_rls_registry_matches_migration_policy_coverage() {
         let central_policy_migrations = [
             include_str!("../../../../migrations/V71__reward_participant_access.sql"),
@@ -6572,6 +6712,13 @@ mod tests {
             include_str!("../../../../migrations/V65__token_distribution_bundles.sql"),
             include_str!("../../../../migrations/V64__trace_public_runs.sql"),
             include_str!("../../../../migrations/V69__mission_insight_rewards.sql"),
+            include_str!("../../../../migrations/V74__versioned_pipeline.sql"),
+            include_str!("../../../../migrations/V75__versioned_pipeline_durability.sql"),
+            include_str!("../../../../migrations/V76__versioned_pipeline_index_credit.sql"),
+            include_str!("../../../../migrations/V77__versioned_pipeline_authority_privacy.sql"),
+            include_str!("../../../../migrations/V78__versioned_pipeline_product_integration.sql"),
+            include_str!("../../../../migrations/V79__versioned_pipeline_qualification.sql"),
+            include_str!("../../../../migrations/V80__versioned_pipeline_activation.sql"),
         ];
         let force_rls_migrations = [
             include_str!("../../../../migrations/V71__reward_participant_access.sql"),
@@ -6594,6 +6741,13 @@ mod tests {
             include_str!("../../../../migrations/V65__token_distribution_bundles.sql"),
             include_str!("../../../../migrations/V64__trace_public_runs.sql"),
             include_str!("../../../../migrations/V69__mission_insight_rewards.sql"),
+            include_str!("../../../../migrations/V74__versioned_pipeline.sql"),
+            include_str!("../../../../migrations/V75__versioned_pipeline_durability.sql"),
+            include_str!("../../../../migrations/V76__versioned_pipeline_index_credit.sql"),
+            include_str!("../../../../migrations/V77__versioned_pipeline_authority_privacy.sql"),
+            include_str!("../../../../migrations/V78__versioned_pipeline_product_integration.sql"),
+            include_str!("../../../../migrations/V79__versioned_pipeline_qualification.sql"),
+            include_str!("../../../../migrations/V80__versioned_pipeline_activation.sql"),
         ];
 
         for table in TRACE_COMMONS_RLS_TABLES {
