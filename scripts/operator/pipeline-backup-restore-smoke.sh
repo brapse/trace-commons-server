@@ -12,11 +12,15 @@ SERVER_LOG="${ROOT}/.local/pipeline-restore-server.log"
 SERVER_PID=""
 
 cleanup() {
+  local status=$?
+  trap - EXIT
+  set +e
   if [[ -n "${SERVER_PID}" ]]; then
     kill "${SERVER_PID}" 2>/dev/null || true
     wait "${SERVER_PID}" 2>/dev/null || true
   fi
   docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  exit "${status}"
 }
 trap cleanup EXIT
 
@@ -106,11 +110,24 @@ docker exec "${CONTAINER}" psql -U postgres -v ON_ERROR_STOP=1 -c "
       next_phase, state
   )
   SELECT tenant_id, '${PENDING_RUN_ID}'::uuid, submission_id, trace_id, bundle_id,
-         'sha256:' || repeat('7', 64), 'sha256:' || repeat('8', 64),
+         'sha256:' || repeat('7', 64), request_content_hash,
          source_object_ref_id, 'review', 'pending'
     FROM pipeline_runs
    WHERE tenant_id = 'tenant-qualification'
    ORDER BY created_at
+   LIMIT 1;
+  INSERT INTO phase_outcomes (
+      tenant_id, outcome_id, run_id, trace_id, phase, bundle_id,
+      outcome_schema_id, outcome_schema_version, decision, evidence, evaluation
+  )
+  SELECT tenant_id, '00000000-0000-4000-8000-000000000702'::uuid,
+         '${PENDING_RUN_ID}'::uuid, trace_id, phase, bundle_id,
+         outcome_schema_id, outcome_schema_version, decision, evidence, evaluation
+    FROM phase_outcomes
+   WHERE tenant_id = 'tenant-qualification'
+     AND phase = 'admission'
+     AND run_id <> '${PENDING_RUN_ID}'::uuid
+   ORDER BY recorded_at
    LIMIT 1;
 " >/dev/null
 
@@ -161,10 +178,16 @@ docker exec "${CONTAINER}" createdb -U postgres restored
 docker exec "${CONTAINER}" pg_restore \
   -U postgres -d restored --no-owner --no-privileges /tmp/pipeline-qualification.dump
 RESTORED_FINGERPRINT="$(fingerprint restored)"
-[[ "${SOURCE_FINGERPRINT}" == "${RESTORED_FINGERPRINT}" ]]
+if [[ "${SOURCE_FINGERPRINT}" != "${RESTORED_FINGERPRINT}" ]]; then
+  echo "PipelineRestoreFailure: database_fingerprint_mismatch" >&2
+  exit 1
+fi
 
 cp -R "${SOURCE_ROOT}" "${RESTORED_ROOT}"
-diff -qr "${SOURCE_ROOT}" "${RESTORED_ROOT}" >/dev/null
+if ! diff -qr "${SOURCE_ROOT}" "${RESTORED_ROOT}" >/dev/null; then
+  echo "PipelineRestoreFailure: artifact_bytes_mismatch" >&2
+  exit 1
+fi
 ARTIFACT_FINGERPRINT="$(
   python3 - "${RESTORED_ROOT}" <<'PY'
 import hashlib
@@ -182,7 +205,10 @@ PY
 
 PENDING_COUNT="$(docker exec "${CONTAINER}" psql -U postgres -d restored -Atc \
   "SELECT COUNT(*) FROM pipeline_runs WHERE run_id = '${PENDING_RUN_ID}' AND state = 'pending'")"
-[[ "${PENDING_COUNT}" == "1" ]]
+if [[ "${PENDING_COUNT}" != "1" ]]; then
+  echo "PipelineRestoreFailure: pending_operation_identity_missing" >&2
+  exit 1
+fi
 
 "${ROOT}/target/debug/trace-commons-pipeline-local" serve \
   --database-url "postgres://postgres:qualification-admin@127.0.0.1:${PG_PORT}/restored" \
@@ -205,13 +231,28 @@ for _ in $(seq 1 4); do
     -H "Authorization: Bearer worker-token" \
     "http://127.0.0.1:${PORT}/v1/pipeline/worker?limit=1" >/dev/null
 done
-RESTORED_STATE="$(
+RESTORED_INSPECTION="$(
   curl --fail --silent \
     -H "Authorization: Bearer operator-token" \
-    "http://127.0.0.1:${PORT}/v1/pipeline/runs/${PENDING_RUN_ID}" |
-    python3 -c 'import json,sys; print(json.load(sys.stdin)["run"]["state"])'
+    "http://127.0.0.1:${PORT}/v1/pipeline/runs/${PENDING_RUN_ID}"
 )"
-[[ "${RESTORED_STATE}" == "complete" ]]
+IFS='|' read -r RESTORED_STATE RESTORED_PHASE RESTORED_ERROR_LABEL <<<"$(
+  python3 -c '
+import json
+import sys
+
+run = json.load(sys.stdin)["run"]
+print("|".join([
+    run["state"],
+    run.get("next_phase") or "none",
+    run.get("last_error_label") or "none",
+]))
+' <<<"${RESTORED_INSPECTION}"
+)"
+if [[ "${RESTORED_STATE}" != "complete" ]]; then
+  echo "PipelineRestoreFailure: pending_operation_state=${RESTORED_STATE} phase=${RESTORED_PHASE} error=${RESTORED_ERROR_LABEL}" >&2
+  exit 1
+fi
 kill "${SERVER_PID}"
 wait "${SERVER_PID}" 2>/dev/null || true
 SERVER_PID=""
