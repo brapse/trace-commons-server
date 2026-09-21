@@ -317,7 +317,11 @@ impl PgBackend {
             .parse::<tokio_postgres::Config>()
             .map_err(|e| DatabaseError::Pool(format!("invalid PostgreSQL URL: {e}")))?;
         let manager = deadpool_postgres::Manager::new(pg_config, tokio_postgres::NoTls);
-        let pool = Pool::builder(manager).max_size(config.pool_size).build()?;
+        let pool = Pool::builder(manager)
+            .max_size(config.pool_size)
+            .runtime(deadpool_postgres::Runtime::Tokio1)
+            .wait_timeout(Some(std::time::Duration::from_secs(1)))
+            .build()?;
 
         // Build a SEPARATE, small resolver pool only when a distinct resolver
         // connection string is configured. This pool runs as the narrow
