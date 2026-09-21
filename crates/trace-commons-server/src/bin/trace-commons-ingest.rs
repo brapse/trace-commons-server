@@ -124,6 +124,9 @@ use trace_commons_server::trace_artifact_store::{
     LocalEncryptedTraceArtifactStore, ServiceOwnedTraceArtifactStore, TraceArtifactKind,
     TraceArtifactProviderConfig, TraceArtifactStore,
 };
+use trace_commons_server::trace_authority::{
+    source_matches_allowed_use_allowlist, source_matches_consent_allowlist,
+};
 #[cfg(test)]
 use trace_commons_server::trace_corpus_storage::TraceRevocationPropagationTargetKind as StorageTraceRevocationPropagationTargetKind;
 use trace_commons_server::trace_corpus_storage::{
@@ -55409,23 +55412,6 @@ fn record_matches_privileged_action_policy_abac(
 
     source_matches_consent_allowlist(&record.consent_scopes, &policy.allowed_consent_scopes)
         && source_matches_allowed_use_allowlist(&record.allowed_uses, &policy.allowed_uses)
-}
-
-fn source_matches_consent_allowlist(
-    source_scopes: &[ConsentScope],
-    allowlist: &BTreeSet<ConsentScope>,
-) -> bool {
-    allowlist.is_empty() || source_scopes.iter().any(|scope| allowlist.contains(scope))
-}
-
-fn source_matches_allowed_use_allowlist(
-    source_uses: &[TraceAllowedUse],
-    allowlist: &BTreeSet<TraceAllowedUse>,
-) -> bool {
-    allowlist.is_empty()
-        || source_uses
-            .iter()
-            .any(|allowed_use| allowlist.contains(allowed_use))
 }
 
 fn ensure_maintenance_purge_matches_privileged_action_policy(

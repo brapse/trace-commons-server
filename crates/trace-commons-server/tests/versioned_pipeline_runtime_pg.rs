@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use secrecy::SecretString;
-use trace_commons_gate_api::pipeline::{InstrumentId, Phase};
+use trace_commons_gate_api::pipeline::{AdmissionDecision, InstrumentId, Phase};
 use trace_commons_gate_api::{ReferenceEmbedder, ReferencePerplexityScorer};
 use trace_commons_protocol::trace_contribution::{
-    DeterministicTraceRedactor, RawTraceCaptureTurn, RawTraceContribution,
-    RecordedTraceContributionOptions, TraceRedactor,
+    DeterministicTraceRedactor, NoopPrivacyFilterAdapter, PiiClassifyPolicy, RawTraceCaptureTurn,
+    RawTraceContribution, RecordedTraceContributionOptions, ResidualPiiRisk,
+    TraceContributionEnvelope, TraceRedactor,
 };
 use trace_commons_server::config::DatabaseConfig;
 use trace_commons_server::db::{Database, postgres::PgBackend};
@@ -18,15 +19,23 @@ use trace_commons_server::secrets::SecretsCrypto;
 use trace_commons_server::trace_artifact_store::{
     LocalEncryptedTraceArtifactStore, TraceArtifactStore,
 };
+use trace_commons_server::trace_authority::{SubmissionAllowlists, SubmissionAuthority};
+use trace_commons_server::trace_corpus_storage::TraceCorpusStore;
 use trace_commons_server::versioned_pipeline::{
     MinimalPolicyBundle, PipelineCaps, PipelineCrashPoint, PipelineInstrumentAwardConfig,
     PipelinePayoutConfig, PipelineReceiptResult, PipelineRunState, PipelineService,
     PipelineServiceBuilder,
 };
+use trace_commons_server::versioned_pipeline_authority::{
+    ClassifierRedactorPipelinePrivacyBoundary, StaticPipelineAuthorityProvider,
+};
+use trace_commons_server::versioned_pipeline_compat::{
+    COMPATIBILITY_SCORE_IMPLEMENTATION, CompatibilityScoreRuntime,
+};
 use trace_commons_server::versioned_pipeline_credit::{
     RecordingNearAdapter, RecordingSettlementAdapter, SettlementAdapterRegistry,
 };
-use trace_commons_server::versioned_pipeline_index::IsolatedPipelineIndex;
+use trace_commons_server::versioned_pipeline_index::{IsolatedPipelineIndex, PIPELINE_INDEX_ID};
 use uuid::Uuid;
 
 static MIGRATION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -82,6 +91,15 @@ async fn envelope_bytes(submission_id: Uuid) -> Vec<u8> {
         .await
         .unwrap();
     envelope.submission_id = submission_id;
+    envelope.privacy.residual_pii_risk = ResidualPiiRisk::Low;
+    serde_json::to_vec(&envelope).unwrap()
+}
+
+async fn envelope_bytes_with_text(submission_id: Uuid, text: &str) -> Vec<u8> {
+    let bytes = envelope_bytes(submission_id).await;
+    let mut envelope: TraceContributionEnvelope = serde_json::from_slice(&bytes).unwrap();
+    envelope.events[0].redacted_content = Some(text.to_string());
+    envelope.privacy.residual_pii_risk = ResidualPiiRisk::Low;
     serde_json::to_vec(&envelope).unwrap()
 }
 
@@ -107,6 +125,21 @@ fn production_service(
         index,
         SettlementAdapterRegistry::new(adapters).unwrap(),
         near,
+        Arc::new(StaticPipelineAuthorityProvider::test_only(
+            SubmissionAuthority {
+                tenant: SubmissionAllowlists::default(),
+                policy: None,
+                require_policy: false,
+            },
+        )),
+        Arc::new(
+            ClassifierRedactorPipelinePrivacyBoundary::new(
+                Arc::new(NoopPrivacyFilterAdapter),
+                PiiClassifyPolicy::AllEvents,
+                "noop_classifier_redactor_test_only",
+            )
+            .unwrap(),
+        ),
         PipelineCaps {
             per_instrument_atomic_units: caps,
         },
@@ -187,6 +220,174 @@ async fn pool_size_one_receipt_avoids_nested_checkout_and_saturation_is_bounded(
             .unwrap(),
         PipelineReceiptResult::Created(_)
     ));
+}
+
+#[tokio::test]
+async fn server_privacy_boundary_avoids_prefix_false_positives_and_quarantines_pii() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let service =
+        PipelineService::new_test_only(backend.clone(), artifact_store(&root), None).unwrap();
+    let tenant = format!("pipeline-privacy-{}", Uuid::new_v4());
+
+    for (index, text) in [
+        "task-123",
+        "risk-model",
+        "disk-cache",
+        "desk-layout",
+        "mask-policy",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let PipelineReceiptResult::Created(run) = service
+            .submit(
+                &tenant,
+                "principal_sha256:test",
+                &format!("ordinary-{index}"),
+                &envelope_bytes_with_text(Uuid::new_v4(), text).await,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("ordinary fixture must create a run");
+        };
+        let inspection = service.inspect(&tenant, run.run_id).await.unwrap().unwrap();
+        let admission: AdmissionDecision =
+            serde_json::from_value(inspection.outcomes[0].decision.clone()).unwrap();
+        assert_eq!(admission, AdmissionDecision::Admit, "{text}");
+    }
+
+    let submission_id = Uuid::new_v4();
+    let PipelineReceiptResult::Created(run) = service
+        .submit(
+            &tenant,
+            "principal_sha256:test",
+            "pii",
+            &envelope_bytes_with_text(submission_id, "Contact jane@example.com").await,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("PII fixture must create a run");
+    };
+    let inspection = service.inspect(&tenant, run.run_id).await.unwrap().unwrap();
+    let admission: AdmissionDecision =
+        serde_json::from_value(inspection.outcomes[0].decision.clone()).unwrap();
+    assert!(matches!(admission, AdmissionDecision::Quarantine { .. }));
+    let stored = backend
+        .get_trace_submission(&tenant, submission_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.privacy_risk, "medium");
+    assert!(stored.redaction_counts.values().any(|count| *count > 0));
+    assert!(
+        stored
+            .residual_risk_basis
+            .as_ref()
+            .is_some_and(|basis| basis.iter().any(|label| label == "found_and_removed"))
+    );
+}
+
+#[tokio::test]
+async fn compatibility_score_reads_and_settle_writes_the_index() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let index = IsolatedPipelineIndex::new();
+    let runtime = CompatibilityScoreRuntime::reference(index.clone());
+    let bundle = MinimalPolicyBundle::build_compatibility(&runtime).unwrap();
+    let near = Arc::new(RecordingNearAdapter::new());
+    let trace_credit = RecordingSettlementAdapter::new(
+        InstrumentId::trace_credit(),
+        "compatibility_trace_credit_test",
+        "near",
+    );
+    let service = PipelineServiceBuilder::production(
+        backend,
+        artifact_store(&root),
+        bundle,
+        Arc::new(ReferencePerplexityScorer::new()),
+        Arc::new(ReferenceEmbedder::new()),
+        index.clone(),
+        index.clone(),
+        SettlementAdapterRegistry::new(vec![trace_credit]).unwrap(),
+        near,
+        Arc::new(StaticPipelineAuthorityProvider::test_only(
+            SubmissionAuthority {
+                tenant: SubmissionAllowlists::default(),
+                policy: None,
+                require_policy: false,
+            },
+        )),
+        Arc::new(
+            ClassifierRedactorPipelinePrivacyBoundary::new(
+                Arc::new(NoopPrivacyFilterAdapter),
+                PiiClassifyPolicy::AllEvents,
+                "noop_classifier_redactor_test_only",
+            )
+            .unwrap(),
+        ),
+        PipelineCaps {
+            per_instrument_atomic_units: BTreeMap::from([(
+                InstrumentId::trace_credit().as_str().to_string(),
+                u64::MAX,
+            )]),
+        },
+        PipelinePayoutConfig {
+            enabled: false,
+            require_confirmation_evidence: true,
+        },
+    )
+    .with_compatibility_runtime(runtime)
+    .build()
+    .unwrap();
+    let tenant = format!("pipeline-compatibility-{}", Uuid::new_v4());
+    let PipelineReceiptResult::Created(run) = service
+        .submit(
+            &tenant,
+            "principal_sha256:test",
+            "compatibility",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("compatibility fixture must create a run");
+    };
+
+    service
+        .process_run(&tenant, run.run_id, None)
+        .await
+        .unwrap();
+    service
+        .process_run(&tenant, run.run_id, Some(Phase::Settle))
+        .await
+        .unwrap();
+    assert_eq!(index.writer_calls(), 0, "Score must remain read-only");
+    let inspection = service.inspect(&tenant, run.run_id).await.unwrap().unwrap();
+    let score = inspection
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.phase == Phase::Score)
+        .unwrap();
+    assert_eq!(
+        score.evaluation["rule_id"],
+        "compatibility_quality_novelty_v1"
+    );
+    assert_eq!(
+        inspection.run.next_phase,
+        Some(Phase::Settle),
+        "{COMPATIBILITY_SCORE_IMPLEMENTATION}"
+    );
+
+    finish_run(&service, &tenant, run.run_id).await;
+    assert!(index.writer_calls() > 0, "Settle must own index writes");
+    assert_eq!(index.entry_count(&tenant, PIPELINE_INDEX_ID), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

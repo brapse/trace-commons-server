@@ -5,15 +5,27 @@
   "corpus": {
     "path": "docs/superpowers/specs/fixtures/versioned-pipeline-minimal-corpus-v1.json",
     "order": "file_sequence",
-    "initial_index": "empty"
+    "initial_index": "empty",
+    "fixture_order": [
+      "clean_tool_plan",
+      "locally_redacted_secret",
+      "privacy_quarantine_approved",
+      "privacy_quarantine_rejected",
+      "privacy_risk_rejected"
+    ]
   },
   "configuration_identities": {
     "scorer_model_id": "reference_perplexity.v1",
     "embedder_model_id": "reference_embedder.v1",
     "projection_id": "pipeline-test-projection-v1",
     "index_id": "pipeline-test-index-v1",
-    "credit_quality_version": 2,
-    "gate_floors": "local_zero_uncalibrated_reference",
+    "credit_quality_version": 3,
+    "gate_floors": {
+      "qualification": "local_synthetic_non_qualifiable",
+      "perplexity_floor_micros": 0,
+      "tail_fraction_floor_micros": 0,
+      "novelty_floor_micros": 0
+    },
     "external_payout": false
   },
   "legacy_to_new": {

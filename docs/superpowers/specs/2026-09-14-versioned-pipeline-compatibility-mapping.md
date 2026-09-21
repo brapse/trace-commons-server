@@ -11,7 +11,7 @@ the Score adapter.
 | Admission and Review policies | `trace_commons.admission.authority_privacy.v1` and `trace_commons.review.authority_privacy.v1` |
 | Scorer | `reference_perplexity.v1` (`ReferencePerplexityScorer`) |
 | Embedder | `reference_embedder.v1` (`ReferenceEmbedder`) |
-| Credit quality | `CREDIT_QUALITY_ACTIVE` version 2 |
+| Credit quality | `CREDIT_QUALITY_ACTIVE` version 3 |
 | Index | isolated `pipeline-test-index-v1` |
 | Projection | `pipeline-test-projection-v1` |
 | Corpus | `docs/superpowers/specs/fixtures/versioned-pipeline-minimal-corpus-v1.json` |
@@ -19,10 +19,12 @@ the Score adapter.
 | Initial index | empty |
 | External payout | disabled |
 
-The local bundle sets gate floors to zero. The reference scorer is not
-calibrated against production models. A staging bundle must put the
-deployed floors into the bundle configuration. Those values change the
-bundle identifier.
+The local bundle sets gate floors to zero.
+The bundle configuration marks this policy as non-qualifiable.
+The reference scorer is not calibrated against production models.
+
+A production-compatible bundle must set nonzero quality and novelty floors.
+These values change the bundle identifier.
 
 ## Legacy result to new decision
 
