@@ -113,9 +113,11 @@
       "evidence_status": "passing",
       "test_ids": [
         "versioned_pipeline_runtime_pg::concurrent_receipt_and_worker_retries_commit_once",
+        "trace_commons_ingest_internal::real_ingest_pipeline_activation_routes_mixed_receipts_and_replays",
+        "versioned_pipeline_runtime_pg::pipeline_activation_rollback_containment_and_writer_retirement",
         "minimal_pipeline_corpus"
       ],
-      "note": "Activation qualifies retries that started on the legacy path."
+      "note": "Activation qualifies exact retries that started on either ownership path."
     },
     {
       "contract_ids": [
@@ -385,6 +387,8 @@
         "versioned_pipeline_compat::legacy_mapping_keeps_inserts_out_of_score",
         "versioned_pipeline_compat::shadow_score_does_not_write_the_active_index",
         "versioned_pipeline_qualification::production_looking_labels_on_synthetic_adapters_cannot_qualify",
+        "trace_commons_ingest_internal::real_ingest_pipeline_activation_routes_mixed_receipts_and_replays",
+        "versioned_pipeline_runtime_pg::pipeline_activation_rollback_containment_and_writer_retirement",
         "pipeline_hf_qualification"
       ]
     },
@@ -404,9 +408,10 @@
         "versioned_pipeline_runtime_pg::contributor_status_pagination_is_bounded_and_stable",
         "versioned_pipeline_runtime_pg::withdrawal_commits_tombstone_propagation_audit_and_export_invalidation_atomically",
         "versioned_pipeline_qualification::production_looking_labels_on_synthetic_adapters_cannot_qualify",
-        "versioned_pipeline_runtime_pg::signed_package_qualification_rejects_nonproduction_candidate"
+        "versioned_pipeline_runtime_pg::signed_package_qualification_rejects_nonproduction_candidate",
+        "versioned_pipeline_runtime_pg::pipeline_activation_rollback_containment_and_writer_retirement"
       ],
-      "note": "Activation retires superseded legacy writers after owned work completes."
+      "note": "Activation retires superseded legacy writers only after owned work completes."
     },
     {
       "contract_ids": [
@@ -551,9 +556,13 @@
     {
       "scenario_id": "SCN-015",
       "implementation_milestone": 8,
-      "evidence_status": "planned",
-      "test_ids": [],
-      "note": "Activation and writer retirement are qualified by the activation stack change."
+      "evidence_status": "passing",
+      "test_ids": [
+        "trace_commons_ingest_internal::real_ingest_pipeline_activation_routes_mixed_receipts_and_replays",
+        "versioned_pipeline_runtime_pg::pipeline_activation_rollback_containment_and_writer_retirement",
+        "versioned_pipeline_activation::readiness_ignores_completed_and_terminal_history_age"
+      ],
+      "note": "Real ingest routing, containment, rollback binding, and writer retirement are qualified."
     }
   ]
 }

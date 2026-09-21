@@ -58,7 +58,8 @@ use crate::versioned_pipeline_credit::{
     PIPELINE_TEST_CREDIT_CAP_MICROCREDITS, RecordingNearAdapter, RecordingSettlementAdapter,
     SettlementAdapterRegistry, SettlementRequest, credit_account_hash, disabled_near_call,
     issuer_approval_hash, microcredits_to_settled_i64, pipeline_credit_event_id,
-    pipeline_near_outbox_line_id, pipeline_settlement_batch_id, source_list_hash,
+    pipeline_ledger_source_key, pipeline_near_outbox_line_id, pipeline_settlement_batch_id,
+    source_list_hash,
 };
 use crate::versioned_pipeline_index::{
     IsolatedPipelineIndex, PIPELINE_INDEX_ID, SealedIndexCommand, deterministic_pipeline_embedding,
@@ -81,6 +82,9 @@ pub const PIPELINE_CREDIT_CAP_LABEL: &str = "credit_cap_exceeded";
 pub const PIPELINE_SUBMISSION_INOPERABLE_LABEL: &str = "submission_inoperable";
 pub const PIPELINE_TOMBSTONE_LABEL: &str = "content_tombstoned";
 pub const PIPELINE_INVALIDATION_FAILED_LABEL: &str = "index_invalidation_failed";
+pub const PIPELINE_CONTAINED_LABEL: &str = "pipeline_contained";
+pub const PIPELINE_NOT_ACTIVE_LABEL: &str = "pipeline_not_active";
+pub const LEGACY_RECEIPT_OWNED_LABEL: &str = "legacy_receipt_owned";
 const DEFAULT_LEASE_SECONDS: i64 = 30;
 const DEFAULT_RETRY_MILLISECONDS: i64 = 50;
 const INJECTED_PIPELINE_CRASH: &str = "injected_pipeline_crash";
@@ -232,6 +236,51 @@ pub struct PipelineRunRecord {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum PolicyOperationalStatus {
+    Runnable,
+    Suspended,
+    Terminated,
+}
+
+impl PolicyOperationalStatus {
+    fn as_db(self) -> &'static str {
+        match self {
+            Self::Runnable => "runnable",
+            Self::Suspended => "suspended",
+            Self::Terminated => "terminated",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self, DatabaseError> {
+        match value {
+            "runnable" => Ok(Self::Runnable),
+            "suspended" => Ok(Self::Suspended),
+            "terminated" => Ok(Self::Terminated),
+            _ => Err(DatabaseError::Serialization(
+                "unknown policy operational status".to_string(),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipelinePolicyInterventionRecord {
+    #[serde(skip_serializing, default)]
+    pub tenant_id: String,
+    pub intervention_id: Uuid,
+    pub bundle_id: String,
+    pub phase: Phase,
+    pub action: String,
+    pub actor_principal_ref: String,
+    pub reason_code: String,
+    pub previous_status: PolicyOperationalStatus,
+    pub resulting_status: PolicyOperationalStatus,
+    pub evidence_hash: String,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PipelineWithdrawalFollowUpState {
     NotRequired,
     Pending,
@@ -374,6 +423,10 @@ pub enum PipelineReceiptResult {
     Created(PipelineRunRecord),
     Replayed(PipelineRunRecord),
     ContentConflict,
+    LegacyOwned {
+        submission_id: Uuid,
+        request_content_hash: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -620,6 +673,160 @@ impl PgPipelineStore {
             .unwrap_or(false);
         tx.commit().await?;
         Ok(runnable)
+    }
+
+    pub async fn intervene_policy(
+        &self,
+        tenant_id: &str,
+        bundle_id: &str,
+        phase: Phase,
+        action: &str,
+        actor_principal_ref: &str,
+        reason_code: &str,
+    ) -> Result<PipelinePolicyInterventionRecord, DatabaseError> {
+        ReasonCode::new(reason_code)
+            .map_err(|_| DatabaseError::Constraint("invalid intervention reason".to_string()))?;
+        if !actor_principal_ref.starts_with("operator_sha256:")
+            && !actor_principal_ref.starts_with("admin_sha256:")
+        {
+            return Err(DatabaseError::Constraint(
+                "invalid intervention actor".to_string(),
+            ));
+        }
+        let resulting = match action {
+            "suspend" => PolicyOperationalStatus::Suspended,
+            "resume" => PolicyOperationalStatus::Runnable,
+            "terminate" => PolicyOperationalStatus::Terminated,
+            _ => {
+                return Err(DatabaseError::Constraint(
+                    "invalid policy intervention".to_string(),
+                ));
+            }
+        };
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let row = tx
+            .query_opt(
+                "SELECT operational_status
+                 FROM pipeline_bundle_policy_status
+                 WHERE tenant_id = $1 AND bundle_id = $2 AND phase = $3
+                 FOR UPDATE",
+                &[&tenant_id, &bundle_id, &phase_as_db(Some(phase))],
+            )
+            .await?
+            .ok_or_else(|| DatabaseError::NotFound {
+                entity: "pipeline_bundle_policy".to_string(),
+                id: format!("{bundle_id}:{}", phase_as_db(Some(phase))),
+            })?;
+        let previous =
+            PolicyOperationalStatus::from_db(row.get::<_, String>("operational_status").as_str())?;
+        if previous == PolicyOperationalStatus::Terminated
+            && resulting != PolicyOperationalStatus::Terminated
+        {
+            return Err(DatabaseError::Constraint(
+                "terminated policy cannot resume".to_string(),
+            ));
+        }
+        let valid_transition = matches!(
+            (previous, resulting),
+            (
+                PolicyOperationalStatus::Runnable,
+                PolicyOperationalStatus::Suspended | PolicyOperationalStatus::Terminated
+            ) | (
+                PolicyOperationalStatus::Suspended,
+                PolicyOperationalStatus::Runnable | PolicyOperationalStatus::Terminated
+            ) | (
+                PolicyOperationalStatus::Terminated,
+                PolicyOperationalStatus::Terminated
+            )
+        );
+        if !valid_transition {
+            return Err(DatabaseError::Constraint(
+                "policy intervention has no valid transition".to_string(),
+            ));
+        }
+        let evidence_hash = sha256_prefixed(
+            format!(
+                "trace-commons-policy-intervention\0{tenant_id}\0{bundle_id}\0{}\0{action}\0{actor_principal_ref}\0{reason_code}\0{}\0{}",
+                phase_as_db(Some(phase)),
+                previous.as_db(),
+                resulting.as_db()
+            )
+            .as_bytes(),
+        );
+        let intervention_id = Uuid::new_v4();
+        tx.execute(
+            "UPDATE pipeline_bundle_policy_status
+             SET runnable = $4, operational_status = $5,
+                 updated_by_principal_ref = $6, reason_code = $7, updated_at = NOW()
+             WHERE tenant_id = $1 AND bundle_id = $2 AND phase = $3",
+            &[
+                &tenant_id,
+                &bundle_id,
+                &phase_as_db(Some(phase)),
+                &(resulting == PolicyOperationalStatus::Runnable),
+                &resulting.as_db(),
+                &actor_principal_ref,
+                &reason_code,
+            ],
+        )
+        .await?;
+        let row = tx
+            .query_one(
+                "INSERT INTO pipeline_policy_interventions (
+                    tenant_id, intervention_id, bundle_id, phase, action,
+                    actor_principal_ref, reason_code, previous_status,
+                    resulting_status, evidence_hash
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                 RETURNING recorded_at",
+                &[
+                    &tenant_id,
+                    &intervention_id,
+                    &bundle_id,
+                    &phase_as_db(Some(phase)),
+                    &action,
+                    &actor_principal_ref,
+                    &reason_code,
+                    &previous.as_db(),
+                    &resulting.as_db(),
+                    &evidence_hash,
+                ],
+            )
+            .await?;
+        let recorded_at = row.get("recorded_at");
+        tx.commit().await?;
+        Ok(PipelinePolicyInterventionRecord {
+            tenant_id: tenant_id.to_string(),
+            intervention_id,
+            bundle_id: bundle_id.to_string(),
+            phase,
+            action: action.to_string(),
+            actor_principal_ref: actor_principal_ref.to_string(),
+            reason_code: reason_code.to_string(),
+            previous_status: previous,
+            resulting_status: resulting,
+            evidence_hash,
+            recorded_at,
+        })
+    }
+
+    pub async fn list_policy_interventions(
+        &self,
+        tenant_id: &str,
+        bundle_id: &str,
+    ) -> Result<Vec<PipelinePolicyInterventionRecord>, DatabaseError> {
+        let mut client = self.backend.trace_pool().get().await?;
+        let tx = Self::tenant_transaction(&mut client, tenant_id).await?;
+        let rows = tx
+            .query(
+                "SELECT * FROM pipeline_policy_interventions
+                 WHERE tenant_id = $1 AND bundle_id = $2
+                 ORDER BY recorded_at ASC, intervention_id ASC",
+                &[&tenant_id, &bundle_id],
+            )
+            .await?;
+        tx.commit().await?;
+        rows.iter().map(policy_intervention_from_row).collect()
     }
 
     pub async fn claim_review(
@@ -2320,6 +2527,22 @@ async fn insert_receipt_records(
             "receipt artifact staging record is missing".to_string(),
         ));
     }
+    tx.execute(
+        "INSERT INTO pipeline_receipt_ownership (
+            tenant_id, request_idempotency_key, request_content_hash, owner,
+            submission_id, run_id, ledger_source_key
+         ) VALUES ($1,$2,$3,'pipeline',$4,$5,$6)
+         ON CONFLICT (tenant_id, request_idempotency_key) DO NOTHING",
+        &[
+            &run.tenant_id,
+            &run.request_idempotency_key,
+            &run.request_content_hash,
+            &run.submission_id,
+            &run.run_id,
+            &pipeline_ledger_source_key(&run.tenant_id, &run.request_idempotency_key),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
@@ -2386,6 +2609,26 @@ async fn ensure_current_lease(
 
 fn stale_lease_error() -> DatabaseError {
     DatabaseError::Constraint("pipeline lease is stale".to_string())
+}
+
+fn policy_intervention_from_row(
+    row: &Row,
+) -> Result<PipelinePolicyInterventionRecord, DatabaseError> {
+    Ok(PipelinePolicyInterventionRecord {
+        tenant_id: row.get("tenant_id"),
+        intervention_id: row.get("intervention_id"),
+        bundle_id: row.get("bundle_id"),
+        phase: phase_from_db(row.get("phase"))?.ok_or_else(|| {
+            DatabaseError::Serialization("intervention phase cannot be none".to_string())
+        })?,
+        action: row.get("action"),
+        actor_principal_ref: row.get("actor_principal_ref"),
+        reason_code: row.get("reason_code"),
+        previous_status: PolicyOperationalStatus::from_db(row.get("previous_status"))?,
+        resulting_status: PolicyOperationalStatus::from_db(row.get("resulting_status"))?,
+        evidence_hash: row.get("evidence_hash"),
+        recorded_at: row.get("recorded_at"),
+    })
 }
 
 fn pipeline_run_from_row(row: &Row) -> Result<PipelineRunRecord, DatabaseError> {
@@ -3588,6 +3831,39 @@ impl PipelineService {
         Ok(self.store.active_bundle_id(tenant_id).await?)
     }
 
+    pub async fn intervene_policy(
+        &self,
+        tenant_id: &str,
+        bundle_id: &str,
+        phase: Phase,
+        action: &str,
+        actor_principal_ref: &str,
+        reason_code: &str,
+    ) -> anyhow::Result<PipelinePolicyInterventionRecord> {
+        Ok(self
+            .store
+            .intervene_policy(
+                tenant_id,
+                bundle_id,
+                phase,
+                action,
+                actor_principal_ref,
+                reason_code,
+            )
+            .await?)
+    }
+
+    pub async fn list_policy_interventions(
+        &self,
+        tenant_id: &str,
+        bundle_id: &str,
+    ) -> anyhow::Result<Vec<PipelinePolicyInterventionRecord>> {
+        Ok(self
+            .store
+            .list_policy_interventions(tenant_id, bundle_id)
+            .await?)
+    }
+
     pub async fn rebuild_index_from_authoritative_commands(
         &self,
         tenant_id: &str,
@@ -3715,6 +3991,30 @@ impl PipelineService {
             &[&receipt_lock],
         )
         .await?;
+        if let Some(owned) = tx
+            .query_opt(
+                "SELECT owner, request_content_hash, submission_id
+                   FROM pipeline_receipt_ownership
+                  WHERE tenant_id = $1 AND request_idempotency_key = $2",
+                &[&tenant_id, &request_idempotency_key_hash],
+            )
+            .await?
+        {
+            let owner: String = owned.get("owner");
+            let owned_hash: String = owned.get("request_content_hash");
+            let submission_id: Uuid = owned.get("submission_id");
+            if owned_hash != request_content_hash {
+                tx.commit().await?;
+                return Ok(PipelineReceiptResult::ContentConflict);
+            }
+            if owner == "legacy" {
+                tx.commit().await?;
+                return Ok(PipelineReceiptResult::LegacyOwned {
+                    submission_id,
+                    request_content_hash: owned_hash,
+                });
+            }
+        }
         if let Some(row) = tx
             .query_opt(
                 "SELECT * FROM pipeline_runs
@@ -3745,14 +4045,44 @@ impl PipelineService {
             tx.commit().await?;
             return Ok(PipelineReceiptResult::ContentConflict);
         }
-        let bundle_id: String = tx
+        let routing_state: Option<String> = tx
             .query_opt(
-                "SELECT bundle_id FROM pipeline_active_bundles WHERE tenant_id = $1",
+                "SELECT routing_state FROM pipeline_tenant_routing WHERE tenant_id = $1",
                 &[&tenant_id],
             )
             .await?
-            .ok_or_else(|| anyhow::anyhow!(PIPELINE_BUNDLE_MISSING_LABEL))?
-            .get("bundle_id");
+            .map(|row| row.get("routing_state"));
+        match routing_state.as_deref() {
+            Some("contained") => {
+                tx.commit().await?;
+                anyhow::bail!(PIPELINE_CONTAINED_LABEL);
+            }
+            Some("legacy") => {
+                tx.commit().await?;
+                anyhow::bail!(PIPELINE_NOT_ACTIVE_LABEL);
+            }
+            Some("pipeline") | None => {}
+            Some(other) => anyhow::bail!("pipeline routing state invalid: {other}"),
+        }
+        let bundle_id: String = tx
+            .query_opt(
+                "SELECT COALESCE(
+                    (
+                        SELECT selected_bundle_id
+                          FROM pipeline_tenant_routing
+                         WHERE tenant_id = $1 AND routing_state = 'pipeline'
+                    ),
+                    (
+                        SELECT bundle_id
+                          FROM pipeline_active_bundles
+                         WHERE tenant_id = $1
+                    )
+                 ) AS bundle_id",
+                &[&tenant_id],
+            )
+            .await?
+            .and_then(|row| row.get::<_, Option<String>>("bundle_id"))
+            .ok_or_else(|| anyhow::anyhow!(PIPELINE_BUNDLE_MISSING_LABEL))?;
         let package = load_bundle_from_transaction(&tx, tenant_id, &bundle_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!(PIPELINE_BUNDLE_MISSING_LABEL))?;
@@ -4633,9 +4963,10 @@ impl PipelineService {
             "INSERT INTO trace_credit_ledger (
                 tenant_id, credit_event_id, submission_id, trace_id, credit_account_ref,
                 event_type, points_delta, reason, external_ref, actor_principal_ref,
-                actor_role, settlement_state, pipeline_run_id, score_outcome_id, instrument_id
+                actor_role, settlement_state, pipeline_run_id, score_outcome_id, instrument_id,
+                ledger_source_key
              ) VALUES (
-                $1,$2,$3,$4,$5,'accepted',$6,$7,$8,$5,'pipeline_worker','pending',$9,$10,$11
+                $1,$2,$3,$4,$5,'accepted',$6,$7,$8,$5,'pipeline_worker','pending',$9,$10,$11,$12
              )
              ON CONFLICT (tenant_id, credit_event_id) DO NOTHING",
             &[
@@ -4650,6 +4981,7 @@ impl PipelineService {
                 &run.run_id,
                 &score_outcome_id,
                 &settlement.instrument_id,
+                &pipeline_ledger_source_key(&run.tenant_id, &run.request_idempotency_key),
             ],
         )
         .await?;

@@ -10,11 +10,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker run --rm --detach \
-  --name "${CONTAINER}" \
-  -e POSTGRES_PASSWORD=qualification-test \
-  -p "127.0.0.1:${PG_PORT}:5432" \
-  postgres:17-alpine >/dev/null
+for attempt in 1 2 3; do
+  if docker run --rm --detach \
+    --name "${CONTAINER}" \
+    -e POSTGRES_PASSWORD=qualification-test \
+    -p "127.0.0.1:${PG_PORT}:5432" \
+    postgres:17-alpine >/dev/null; then
+    break
+  fi
+  docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  if [[ "${attempt}" == "3" ]]; then
+    echo "pipeline qualification PostgreSQL did not start" >&2
+    exit 1
+  fi
+  sleep 1
+done
 for _ in $(seq 1 60); do
   if docker exec "${CONTAINER}" pg_isready -U postgres >/dev/null 2>&1; then
     break
@@ -50,3 +60,8 @@ TRACE_COMMONS_PG_TEST_DATABASE_URL="postgres://pipeline_qualification_runtime:qu
   TRACE_COMMONS_PIPELINE_REQUIRE_NOBYPASSRLS=1 \
   RUSTFLAGS="-D warnings" \
   cargo test -p trace-commons-server --test versioned_pipeline_runtime_pg
+
+TRACE_COMMONS_PG_TEST_DATABASE_URL="postgres://pipeline_qualification_runtime:qualification-runtime@127.0.0.1:${PG_PORT}/postgres" \
+  RUSTFLAGS="-D warnings" \
+  cargo test -p trace-commons-server --bin trace-commons-ingest \
+  real_ingest_pipeline_activation_routes_mixed_receipts_and_replays -- --test-threads=1

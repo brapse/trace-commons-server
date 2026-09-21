@@ -28,6 +28,11 @@ use trace_commons_server::versioned_pipeline::{
     PipelinePayoutConfig, PipelineReceiptResult, PipelineRunState, PipelineService,
     PipelineServiceBuilder, PipelineWithdrawalFollowUpState,
 };
+use trace_commons_server::versioned_pipeline_activation::{
+    ACTIVATION_READINESS_FAILED_LABEL, ActivationReadiness, BOUND_POLICY_MUST_BE_SUSPENDED_LABEL,
+    LEGACY_WRITER_PENDING_LABEL, PipelineActivationStore, ReceiptOwner, RoutingState,
+    SwitchedReceipt,
+};
 use trace_commons_server::versioned_pipeline_authority::{
     ClassifierRedactorPipelinePrivacyBoundary, StaticPipelineAuthorityProvider,
 };
@@ -36,6 +41,7 @@ use trace_commons_server::versioned_pipeline_compat::{
 };
 use trace_commons_server::versioned_pipeline_credit::{
     RecordingNearAdapter, RecordingSettlementAdapter, SettlementAdapterRegistry,
+    pipeline_ledger_source_key,
 };
 use trace_commons_server::versioned_pipeline_index::{
     IndexFault, IsolatedPipelineIndex, PIPELINE_INDEX_ID,
@@ -48,7 +54,7 @@ use trace_commons_server::versioned_pipeline_qualification::{
     BundlePackageSignature, BundlePackageTrustStore, BundleQualificationMetadata,
     PACKAGE_DEVELOPMENT_DEPENDENCY_LABEL, PACKAGE_SIGNATURE_ALGORITHM, PipelineQualificationStore,
     ProductionAdapterKind, ProductionDependencyProfile, ProductionInfrastructureProfile,
-    SignedBundlePackage, TrustedBundleKey,
+    PromotionDecision, SignedBundlePackage, TrustedBundleKey,
 };
 use uuid::Uuid;
 
@@ -448,7 +454,9 @@ async fn concurrent_receipt_and_worker_retries_commit_once() {
             PipelineReceiptResult::Created(run) | PipelineReceiptResult::Replayed(run) => {
                 Some(run.run_id)
             }
-            PipelineReceiptResult::ContentConflict => None,
+            PipelineReceiptResult::ContentConflict | PipelineReceiptResult::LegacyOwned { .. } => {
+                None
+            }
         })
         .unwrap();
     for _ in 0..3 {
@@ -513,6 +521,42 @@ async fn multi_instrument_failure_retry_and_crash_are_independent_and_authoritat
         "storage-rebate-adapter-v1"
     );
     assert_eq!(identity.index_reader, "isolated_index_reader_test_only");
+
+    service
+        .submit(
+            &tenant,
+            "principal_sha256:test",
+            "activation-bootstrap",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap();
+    let mut activation_client = backend.trace_pool_for_test().get().await.unwrap();
+    let activation_tx = activation_client.transaction().await.unwrap();
+    activation_tx
+        .execute(
+            "SELECT set_config('trace_commons.trace_tenant_id', $1, true)",
+            &[&tenant],
+        )
+        .await
+        .unwrap();
+    activation_tx
+        .execute(
+            "INSERT INTO pipeline_tenant_routing (
+                tenant_id, routing_state, selected_bundle_id, activation_record_id,
+                actor_principal_ref, reason_code, evidence_hash
+             ) VALUES ($1,'pipeline',$2,$3,$4,'activate_test',$5)",
+            &[
+                &tenant,
+                &service.bundle_id(),
+                &Uuid::new_v4(),
+                &"operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                &sha256_prefixed(b"multi-instrument-activation"),
+            ],
+        )
+        .await
+        .unwrap();
+    activation_tx.commit().await.unwrap();
 
     let PipelineReceiptResult::Created(created) = service
         .submit(
@@ -664,6 +708,371 @@ async fn multi_instrument_failure_retry_and_crash_are_independent_and_authoritat
         .get(0);
     tx.commit().await.unwrap();
     assert_eq!(legacy_state, "pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pipeline_activation_rollback_containment_and_writer_retirement() {
+    let Some(backend) = backend(4).await else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let tenant = format!("pipeline-activation-{}", Uuid::new_v4());
+    let service = PipelineService::new_test_only(backend.clone(), artifact_store(&root), None)
+        .expect("pipeline service");
+    let activation = PipelineActivationStore::new(backend.clone());
+    let legacy_bytes = envelope_bytes(Uuid::new_v4()).await;
+    let (first, second) = tokio::join!(
+        activation.record_legacy_receipt(
+            &tenant,
+            "principal_sha256:test",
+            "legacy-first",
+            &legacy_bytes,
+            true,
+            1_000_000,
+        ),
+        activation.record_legacy_receipt(
+            &tenant,
+            "principal_sha256:test",
+            "legacy-first",
+            &legacy_bytes,
+            true,
+            1_000_000,
+        )
+    );
+    let receipts = [first.unwrap(), second.unwrap()];
+    assert_eq!(
+        receipts
+            .iter()
+            .filter(|receipt| matches!(
+                receipt,
+                SwitchedReceipt::Legacy {
+                    replayed: false,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    let legacy_owner = activation
+        .ownership(&tenant, "legacy-first")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(legacy_owner.owner, ReceiptOwner::Legacy);
+    assert_eq!(
+        legacy_owner.ledger_source_key,
+        pipeline_ledger_source_key(&tenant, &sha256_prefixed(b"legacy-first"))
+    );
+    let mut ledger_client = backend.trace_pool_for_test().get().await.unwrap();
+    let ledger_tx = ledger_client.transaction().await.unwrap();
+    ledger_tx
+        .execute(
+            "SELECT set_config('trace_commons.trace_tenant_id', $1, true)",
+            &[&tenant],
+        )
+        .await
+        .unwrap();
+    let ledger_award_count: i64 = ledger_tx
+        .query_one(
+            "SELECT COUNT(*)::BIGINT
+               FROM trace_credit_ledger
+              WHERE tenant_id = $1 AND ledger_source_key = $2",
+            &[&tenant, &legacy_owner.ledger_source_key],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    ledger_tx.commit().await.unwrap();
+    assert_eq!(ledger_award_count, 1);
+    let mut changed = legacy_bytes.clone();
+    changed.push(b' ');
+    assert!(matches!(
+        activation
+            .record_legacy_receipt(
+                &tenant,
+                "principal_sha256:test",
+                "legacy-first",
+                &changed,
+                true,
+                1_000_000,
+            )
+            .await
+            .unwrap(),
+        SwitchedReceipt::ContentConflict
+    ));
+
+    service
+        .submit(
+            &tenant,
+            "principal_sha256:test",
+            "activation-bootstrap",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap();
+    let bundle_b = MinimalPolicyBundle::build_variant("activation-rollback-b").unwrap();
+    service
+        .register_bundle(&tenant, &bundle_b.package)
+        .await
+        .unwrap();
+    let mut client = backend.trace_pool_for_test().get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.execute(
+        "SELECT set_config('trace_commons.trace_tenant_id', $1, true)",
+        &[&tenant],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO pipeline_tenant_routing (
+            tenant_id, routing_state, selected_bundle_id, activation_record_id,
+            actor_principal_ref, reason_code, evidence_hash
+         ) VALUES ($1,'pipeline',$2,$3,$4,'activate_test',$5)",
+        &[
+            &tenant,
+            &service.bundle_id(),
+            &Uuid::new_v4(),
+            &"operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            &sha256_prefixed(b"activation-a"),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let first_pipeline = match activation
+        .submit_switched(
+            &service,
+            &tenant,
+            "principal_sha256:test",
+            "pipeline-a",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap()
+    {
+        SwitchedReceipt::Pipeline(receipt) => match *receipt {
+            PipelineReceiptResult::Created(run) => run,
+            other => panic!("expected created run, got {other:?}"),
+        },
+        other => panic!("expected pipeline receipt, got {other:?}"),
+    };
+    assert_eq!(first_pipeline.bundle_id, service.bundle_id());
+    let refused = activation
+        .switch_bound_run_bundle(&tenant, first_pipeline.run_id, &bundle_b.package.bundle_id)
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains(BOUND_POLICY_MUST_BE_SUSPENDED_LABEL)
+    );
+    service
+        .intervene_policy(
+            &tenant,
+            service.bundle_id(),
+            first_pipeline.next_phase.unwrap(),
+            "suspend",
+            "operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "unsafe_bound_policy",
+        )
+        .await
+        .unwrap();
+    let suspended = service
+        .process_run(&tenant, first_pipeline.run_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(suspended.state, PipelineRunState::Retry);
+    assert_eq!(
+        suspended.last_error_label.as_deref(),
+        Some("bundle_policy_not_runnable")
+    );
+    service
+        .intervene_policy(
+            &tenant,
+            service.bundle_id(),
+            first_pipeline.next_phase.unwrap(),
+            "resume",
+            "operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "resume_after_suspend",
+        )
+        .await
+        .unwrap();
+
+    let mut client = backend.trace_pool_for_test().get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.execute(
+        "SELECT set_config('trace_commons.trace_tenant_id', $1, true)",
+        &[&tenant],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "UPDATE pipeline_tenant_routing
+            SET selected_bundle_id = $2, activation_record_id = $3,
+                reason_code = 'rollback_test', evidence_hash = $4
+          WHERE tenant_id = $1",
+        &[
+            &tenant,
+            &bundle_b.package.bundle_id,
+            &Uuid::new_v4(),
+            &sha256_prefixed(b"activation-b"),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let later = match activation
+        .submit_switched(
+            &service,
+            &tenant,
+            "principal_sha256:test",
+            "pipeline-b",
+            &envelope_bytes(Uuid::new_v4()).await,
+        )
+        .await
+        .unwrap()
+    {
+        SwitchedReceipt::Pipeline(receipt) => match *receipt {
+            PipelineReceiptResult::Created(run) => run,
+            other => panic!("expected created run, got {other:?}"),
+        },
+        other => panic!("expected pipeline receipt, got {other:?}"),
+    };
+    assert_eq!(later.bundle_id, bundle_b.package.bundle_id);
+    assert_eq!(
+        service
+            .inspect(&tenant, first_pipeline.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run
+            .bundle_id,
+        service.bundle_id()
+    );
+
+    let mut failed_readiness = ActivationReadiness::passing(Utc::now());
+    failed_readiness.max_work_age_seconds = 301;
+    let dependencies = ProductionDependencyProfile::from_runtime(
+        &service,
+        ProductionInfrastructureProfile {
+            authoritative_metadata: ProductionAdapterKind::Production,
+            artifact_store: ProductionAdapterKind::Production,
+            key_wrapper: ProductionAdapterKind::Production,
+            authentication: ProductionAdapterKind::Production,
+            plaintext_fallback: false,
+            best_effort_database_mirror: false,
+            static_bearer_authentication: false,
+            hs256_bridge_authentication: false,
+            unversioned_policy_dependencies: false,
+            live_external_payout_enabled: false,
+        },
+    );
+    let expansion = activation
+        .expand_activation(
+            &tenant,
+            &format!("{tenant}-expanded"),
+            &bundle_b.package.bundle_id,
+            "operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "expand_cohort",
+            &PromotionDecision {
+                ready: true,
+                evaluated_at: Utc::now(),
+                evidence_hash: sha256_prefixed(b"expansion-evidence"),
+                safe_blockers: Vec::new(),
+            },
+            &failed_readiness,
+            &sha256_prefixed(b"runtime-code"),
+            &dependencies,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        expansion
+            .to_string()
+            .contains(ACTIVATION_READINESS_FAILED_LABEL)
+    );
+
+    let retirement = activation
+        .retire_legacy_writer(
+            &tenant,
+            "operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "retire_legacy_writer",
+        )
+        .await
+        .unwrap_err();
+    assert!(retirement.to_string().contains(LEGACY_WRITER_PENDING_LABEL));
+    assert!(matches!(
+        activation
+            .record_legacy_receipt(
+                &tenant,
+                "principal_sha256:test",
+                "legacy-after-drain",
+                &envelope_bytes(Uuid::new_v4()).await,
+                true,
+                0,
+            )
+            .await
+            .unwrap(),
+        SwitchedReceipt::WriterDisabled
+    ));
+    assert!(matches!(
+        activation
+            .record_legacy_receipt(
+                &tenant,
+                "principal_sha256:test",
+                "legacy-first",
+                &legacy_bytes,
+                true,
+                0,
+            )
+            .await
+            .unwrap(),
+        SwitchedReceipt::Legacy { replayed: true, .. }
+    ));
+    activation
+        .complete_legacy_work(&tenant, "legacy-first")
+        .await
+        .unwrap();
+    activation
+        .retire_legacy_writer(
+            &tenant,
+            "operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "retire_legacy_writer",
+        )
+        .await
+        .unwrap();
+    activation
+        .contain_pipeline(
+            &tenant,
+            "operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "contain_first_rollout",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        activation
+            .routing(&tenant)
+            .await
+            .unwrap()
+            .unwrap()
+            .routing_state,
+        RoutingState::Contained
+    );
+    assert!(matches!(
+        activation
+            .submit_switched(
+                &service,
+                &tenant,
+                "principal_sha256:test",
+                "contained",
+                &envelope_bytes(Uuid::new_v4()).await,
+            )
+            .await
+            .unwrap(),
+        SwitchedReceipt::Contained
+    ));
 }
 
 #[tokio::test]

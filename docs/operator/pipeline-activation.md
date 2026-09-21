@@ -18,7 +18,23 @@ The pipeline now has these properties:
 - First-rollout containment stops new pipeline receipts. Workers and
   packages remain available.
 - Legacy writers disable only after their pending owned work completes.
-- Destructive schema cleanup is not part of this phase.
+- Destructive schema cleanup is not part of this change.
+- Work-age readiness includes only `pending`, `retry`, and `leased` work.
+- Completed work and terminal failed history do not block activation.
+
+## Production receipt route
+
+`POST /v1/traces` reads the tenant and actor from authenticated request data.
+The envelope tenant field does not select the owner.
+
+The handler records one owner before either writer continues. An exact retry
+uses the stored owner. Reuse with different request bytes returns `409`.
+
+The ingest process must have the production pipeline runtime before a tenant
+uses pipeline routing. If the runtime is absent, the handler returns `503`.
+
+Containment returns `503` for a new receipt. Existing runs keep their bound
+package and remain available to workers.
 
 ## Rehearse the switch
 
@@ -34,6 +50,9 @@ pre-switch receipt, unique ledger sources, tenant expansion gates,
 rollback, containment, suspension instead of rebinding, and writer
 retirement after pending work completes.
 
+The ingest binary test covers concurrent first receipt, exact replay, changed
+content, and one stored owner on the real `POST /v1/traces` handler.
+
 The [local pipeline lab](pipeline-lab.md) `qualify` command runs this suite as part of pipeline qualification. Lab corpus and package evidence remains in local files;
 these PostgreSQL integration tests remain separate schema and recovery checks.
 
@@ -46,8 +65,8 @@ these PostgreSQL integration tests remain separate schema and recovery checks.
 - `POST /v1/admin/pipeline-contain`
 - `POST /v1/admin/pipeline-retire-legacy-writer`
 
-The existing corpus paths still submit directly to the pipeline executor.
-The switched route is the dual-path receipt used during migration.
+The local switched route is an operator rehearsal surface. Production clients
+use `POST /v1/traces`.
 
 ## Current completion
 

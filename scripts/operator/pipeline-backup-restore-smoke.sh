@@ -24,11 +24,21 @@ mkdir -p "${ROOT}/.local"
 rm -rf "${SOURCE_ROOT}" "${RESTORED_ROOT}"
 rm -f "${REPORT}" "${SERVER_LOG}"
 
-docker run --rm --detach \
-  --name "${CONTAINER}" \
-  -e POSTGRES_PASSWORD=qualification-admin \
-  -p "127.0.0.1:${PG_PORT}:5432" \
-  postgres:17-alpine >/dev/null
+for attempt in 1 2 3; do
+  if docker run --rm --detach \
+    --name "${CONTAINER}" \
+    -e POSTGRES_PASSWORD=qualification-admin \
+    -p "127.0.0.1:${PG_PORT}:5432" \
+    postgres:17-alpine >/dev/null; then
+    break
+  fi
+  docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
+  if [[ "${attempt}" == "3" ]]; then
+    echo "pipeline restore PostgreSQL did not start" >&2
+    exit 1
+  fi
+  sleep 1
+done
 
 for _ in $(seq 1 60); do
   if docker exec "${CONTAINER}" pg_isready -U postgres >/dev/null 2>&1; then

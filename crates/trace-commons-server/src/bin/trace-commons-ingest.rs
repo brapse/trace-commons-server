@@ -244,6 +244,10 @@ use trace_commons_server::trace_score_attestation::{
     ScoreAttestationSubmissionEntry, sign_scoped_score_attestation, sign_score_attestation,
     sign_versioned_score_attestation,
 };
+use trace_commons_server::versioned_pipeline::{PipelineReceiptResult, PipelineService};
+use trace_commons_server::versioned_pipeline_activation::{
+    PIPELINE_RUNTIME_UNAVAILABLE_LABEL, PipelineActivationStore, SwitchedReceipt,
+};
 use trace_commons_server::versioned_pipeline_product::{
     PipelineContributorStatus, PipelineExportSnapshot, PipelineForensicTrace,
     PipelineOperationalSummary, PipelineProductStore, sha256_prefixed as product_sha256_prefixed,
@@ -1560,6 +1564,8 @@ struct AppState {
     tenant_policies: Arc<BTreeMap<String, TenantSubmissionPolicy>>,
     require_tenant_submission_policy: bool,
     db_mirror: Option<Arc<dyn Database>>,
+    pipeline_activation: Option<PipelineActivationStore>,
+    pipeline_service: Option<Arc<PipelineService>>,
     pipeline_product: Option<PipelineProductStore>,
     db_contributor_reads: bool,
     db_reviewer_reads: bool,
@@ -3538,6 +3544,9 @@ impl AppState {
         let pipeline_product = db_connections
             .as_ref()
             .map(|connections| PipelineProductStore::new(connections.postgres.clone()));
+        let pipeline_activation = db_connections
+            .as_ref()
+            .map(|connections| PipelineActivationStore::new(connections.postgres.clone()));
         let postgres_runtime_role_sha256 = parse_postgres_runtime_role_sha256_from_env()?;
         let require_postgres_trace_rls_ready =
             env_truthy(TRACE_COMMONS_REQUIRE_POSTGRES_TRACE_RLS_READY);
@@ -4137,6 +4146,8 @@ impl AppState {
             tenant_policies: Arc::new(tenant_policies),
             require_tenant_submission_policy,
             db_mirror,
+            pipeline_activation,
+            pipeline_service: None,
             pipeline_product,
             db_contributor_reads,
             db_reviewer_reads,
@@ -13377,6 +13388,18 @@ async fn submit_trace_handler(
             if principal_can_remediate_quarantined(tenant.auth(), &existing) {
                 Some(existing)
             } else {
+                if let Some(activation) = state.pipeline_activation.as_ref()
+                    && let Some(owned) = activation
+                        .ownership(tenant.tenant_id(), &envelope.submission_id.to_string())
+                        .await
+                        .map_err(internal_error)?
+                    && owned.request_content_hash != product_sha256_prefixed(&raw_body)
+                {
+                    return Err(api_error(
+                        StatusCode::CONFLICT,
+                        "receipt id reused with different content",
+                    ));
+                }
                 let receipt = receipt_from_record(&existing, state.near_settlement_mode);
                 append_audit_event(
                     &state.root,
@@ -13450,6 +13473,12 @@ async fn submit_trace_handler(
         }
         apply_embedding_precheck(&mut envelope, &derived_precheck);
         apply_credit_estimate_to_envelope(&mut envelope);
+        let (pipeline_receipt, legacy_owned_work) =
+            route_real_ingest_receipt(state.as_ref(), &tenant, envelope.submission_id, &raw_body)
+                .await?;
+        if let Some(receipt) = pipeline_receipt {
+            return Ok(Json(receipt));
+        }
         let corpus_status = status_for_risk(
             envelope.privacy.residual_pii_risk,
             state.accept_medium_risk_submissions,
@@ -13604,6 +13633,12 @@ async fn submit_trace_handler(
             enforce_db_mirror_write_result(state.as_ref(), "submission", mirror_result)
                 .map_err(internal_error)?;
         }
+        if legacy_owned_work && let Some(activation) = state.pipeline_activation.as_ref() {
+            activation
+                .complete_legacy_work(tenant.tenant_id(), &envelope.submission_id.to_string())
+                .await
+                .map_err(internal_error)?;
+        }
 
         // Best-effort cleanup of the pre-remediation artifact once the new
         // pointers are durable. Same-path overwrite (status stayed quarantined) is
@@ -13642,6 +13677,70 @@ async fn submit_trace_handler(
             .await?;
     }
     result
+}
+
+async fn route_real_ingest_receipt(
+    state: &AppState,
+    tenant: &TenantCtx,
+    submission_id: Uuid,
+    request_bytes: &[u8],
+) -> ApiResult<(Option<TraceSubmissionReceipt>, bool)> {
+    let Some(activation) = state.pipeline_activation.as_ref() else {
+        return Ok((None, false));
+    };
+    let routed = activation
+        .submit_ingest_receipt(
+            state.pipeline_service.as_deref(),
+            tenant.tenant_id(),
+            tenant.principal_ref(),
+            &submission_id.to_string(),
+            request_bytes,
+        )
+        .await
+        .map_err(|error| {
+            if error
+                .to_string()
+                .contains(PIPELINE_RUNTIME_UNAVAILABLE_LABEL)
+            {
+                api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "pipeline receipt runtime is unavailable",
+                )
+            } else {
+                internal_error(error)
+            }
+        })?;
+    match routed {
+        SwitchedReceipt::Legacy { pending_work, .. } => Ok((None, pending_work)),
+        SwitchedReceipt::Pipeline(result) => match *result {
+            PipelineReceiptResult::Created(_) | PipelineReceiptResult::Replayed(_) => Ok((
+                Some(TraceSubmissionReceipt {
+                    status: "processing".to_string(),
+                    credit_points_pending: None,
+                    credit_points_final: None,
+                    explanation: vec!["Accepted for pipeline processing.".to_string()],
+                }),
+                false,
+            )),
+            PipelineReceiptResult::ContentConflict => Err(api_error(
+                StatusCode::CONFLICT,
+                "receipt id reused with different content",
+            )),
+            PipelineReceiptResult::LegacyOwned { .. } => Ok((None, true)),
+        },
+        SwitchedReceipt::ContentConflict => Err(api_error(
+            StatusCode::CONFLICT,
+            "receipt id reused with different content",
+        )),
+        SwitchedReceipt::Contained => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "pipeline receipt intake is contained",
+        )),
+        SwitchedReceipt::WriterDisabled => Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "legacy receipt writer is disabled",
+        )),
+    }
 }
 
 async fn revoke_trace_handler(

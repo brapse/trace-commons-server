@@ -33,6 +33,9 @@ fn source_for_module(module: &str) -> Option<&'static str> {
     match module {
         "pipeline" => Some("crates/trace-commons-gate-api/src/pipeline.rs"),
         "versioned_pipeline" => Some("crates/trace-commons-server/src/versioned_pipeline.rs"),
+        "versioned_pipeline_activation" => {
+            Some("crates/trace-commons-server/src/versioned_pipeline_activation.rs")
+        }
         "versioned_pipeline_compat" => {
             Some("crates/trace-commons-server/src/versioned_pipeline_compat.rs")
         }

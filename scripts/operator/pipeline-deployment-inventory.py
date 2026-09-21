@@ -113,6 +113,9 @@ CORPUS_EVIDENCE = {
 RUST_MODULES = {
     "pipeline": "crates/trace-commons-gate-api/src/pipeline.rs",
     "versioned_pipeline": "crates/trace-commons-server/src/versioned_pipeline.rs",
+    "versioned_pipeline_activation": (
+        "crates/trace-commons-server/src/versioned_pipeline_activation.rs"
+    ),
     "versioned_pipeline_compat": "crates/trace-commons-server/src/versioned_pipeline_compat.rs",
     "versioned_pipeline_index": "crates/trace-commons-server/src/versioned_pipeline_index.rs",
     "versioned_pipeline_qualification": (

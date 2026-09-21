@@ -96,7 +96,7 @@ generated_at = datetime.now(timezone.utc).isoformat()
 drill_sources = {
     "tenant_isolation": "versioned_pipeline_runtime_pg::concurrent_receipt_and_worker_retries_commit_once",
     "bundle_package_integrity": "versioned_pipeline_qualification::package_signature_binds_canonical_package_and_trusted_key",
-    "bundle_activation_rollback": None,
+    "bundle_activation_rollback": "versioned_pipeline_runtime_pg::pipeline_activation_rollback_containment_and_writer_retirement",
     "phase_outcome_atomicity": "versioned_pipeline_runtime_pg::concurrent_receipt_and_worker_retries_commit_once",
     "fenced_lease_recovery": "versioned_pipeline_runtime_pg::crash_reuses_completed_operations_and_payout_waits_for_confirmation_evidence",
     "settle_command_recovery": "versioned_pipeline_runtime_pg::multi_instrument_failure_retry_and_crash_are_independent_and_authoritative",
@@ -112,11 +112,7 @@ drill_sources = {
 drills = []
 for drill_id, test_id in drill_sources.items():
     status = "pass" if test_id else "blocked"
-    blockers = [] if test_id else [
-        "activation_not_qualified"
-        if drill_id == "bundle_activation_rollback"
-        else "hf_corpus_evidence_missing"
-    ]
+    blockers = [] if test_id else ["hf_corpus_evidence_missing"]
     evidence = hashlib.sha256(
         f"{revision_hash}:{drill_id}:{test_id}".encode()
     ).hexdigest()
@@ -161,7 +157,6 @@ report = {
         "synthetic_index",
         "synthetic_settlement",
         "static_bearer_authentication",
-        "activation_not_qualified",
         "hf_corpus_evidence_missing",
     ],
     "external_payout_enabled": False,

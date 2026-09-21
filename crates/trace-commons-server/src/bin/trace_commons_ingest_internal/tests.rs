@@ -206,6 +206,188 @@ async fn cleanup_pg_trace_tenant(backend: &PgBackend, tenant_id: &str) {
     tx.commit().await.expect("commit cleanup transaction");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_ingest_pipeline_activation_routes_mixed_receipts_and_replays() {
+    let Some(backend) = postgres_backend_for_ingest_test().await else {
+        return;
+    };
+    cleanup_pg_trace_tenant(&backend, "tenant-a").await;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let artifacts = Arc::new(LocalEncryptedTraceArtifactStore::new(
+        temp.path().join("activation-artifacts"),
+        SecretsCrypto::new(SecretString::from(
+            "real-ingest-activation-test-key-material".to_string(),
+        ))
+        .expect("artifact crypto"),
+    ));
+    let service = Arc::new(
+        PipelineService::new_test_only(backend.clone(), artifacts.clone(), None)
+            .expect("pipeline service"),
+    );
+    let database: Arc<dyn Database> = backend.clone();
+    let mut state = test_state_with_options(
+        temp.path().to_path_buf(),
+        Some(database),
+        Some(artifacts),
+        false,
+        false,
+        false,
+        false,
+    );
+    let state_mut = Arc::make_mut(&mut state);
+    state_mut.pipeline_activation = Some(PipelineActivationStore::new(backend.clone()));
+    state_mut.pipeline_service = Some(service.clone());
+
+    let mut legacy = sample_envelope().await;
+    make_metadata_only_low_risk(&mut legacy);
+    let legacy_id = legacy.submission_id;
+    let first = submit_trace_handler(
+        State(state.clone()),
+        auth_headers("token-a"),
+        SubmitBody::for_test(legacy.clone()),
+    )
+    .await
+    .expect("legacy receipt");
+    let replay = submit_trace_handler(
+        State(state.clone()),
+        auth_headers("token-a"),
+        SubmitBody::for_test(legacy.clone()),
+    )
+    .await
+    .expect("legacy replay");
+    assert_eq!(replay.0, first.0);
+    let activation = state.pipeline_activation.as_ref().unwrap();
+    let legacy_owner = activation
+        .ownership("tenant-a", &legacy_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        legacy_owner.owner,
+        trace_commons_server::versioned_pipeline_activation::ReceiptOwner::Legacy
+    );
+    assert_eq!(
+        activation
+            .pending_legacy_work_count("tenant-a")
+            .await
+            .unwrap(),
+        0
+    );
+
+    let mut changed_legacy = legacy;
+    changed_legacy
+        .privacy
+        .warnings
+        .push("changed-content".to_string());
+    let changed = submit_trace_handler(
+        State(state.clone()),
+        auth_headers("token-a"),
+        SubmitBody::for_test(changed_legacy),
+    )
+    .await
+    .expect_err("changed legacy content must conflict");
+    assert_eq!(changed.0, StatusCode::CONFLICT);
+
+    let bootstrap = sample_envelope().await;
+    service
+        .submit(
+            "tenant-a",
+            "principal_sha256:bootstrap",
+            "activation-bootstrap",
+            &serde_json::to_vec(&bootstrap).unwrap(),
+        )
+        .await
+        .expect("register default package");
+    let mut client = backend
+        .trace_pool_for_test()
+        .get()
+        .await
+        .expect("routing connection");
+    let tx = client.transaction().await.expect("routing transaction");
+    tx.execute(
+        "SELECT set_config('trace_commons.trace_tenant_id', 'tenant-a', true)",
+        &[],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO pipeline_tenant_routing (
+            tenant_id, routing_state, selected_bundle_id, activation_record_id,
+            actor_principal_ref, reason_code, evidence_hash
+         ) VALUES ($1,'pipeline',$2,$3,$4,'activate_test',$5)",
+        &[
+            &"tenant-a",
+            &service.bundle_id(),
+            &Uuid::new_v4(),
+            &"operator_sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            &product_sha256_prefixed(b"real-ingest-activation"),
+        ],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut pipeline = sample_envelope().await;
+    make_metadata_only_low_risk(&mut pipeline);
+    let pipeline_id = pipeline.submission_id;
+    let (left, right) = tokio::join!(
+        submit_trace_handler(
+            State(state.clone()),
+            auth_headers("token-a"),
+            SubmitBody::for_test(pipeline.clone()),
+        ),
+        submit_trace_handler(
+            State(state.clone()),
+            auth_headers("token-a"),
+            SubmitBody::for_test(pipeline.clone()),
+        )
+    );
+    assert_eq!(left.unwrap().0.status, "processing");
+    assert_eq!(right.unwrap().0.status, "processing");
+    let pipeline_owner = activation
+        .ownership("tenant-a", &pipeline_id.to_string())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pipeline_owner.owner,
+        trace_commons_server::versioned_pipeline_activation::ReceiptOwner::Pipeline
+    );
+    let original_run = pipeline_owner.run_id.unwrap();
+    let replay = submit_trace_handler(
+        State(state.clone()),
+        auth_headers("token-a"),
+        SubmitBody::for_test(pipeline.clone()),
+    )
+    .await
+    .expect("pipeline replay");
+    assert_eq!(replay.0.status, "processing");
+    assert_eq!(
+        activation
+            .ownership("tenant-a", &pipeline_id.to_string())
+            .await
+            .unwrap()
+            .unwrap()
+            .run_id,
+        Some(original_run)
+    );
+
+    let mut changed_pipeline = pipeline;
+    changed_pipeline
+        .privacy
+        .warnings
+        .push("changed-content".to_string());
+    let changed = submit_trace_handler(
+        State(state),
+        auth_headers("token-a"),
+        SubmitBody::for_test(changed_pipeline),
+    )
+    .await
+    .expect_err("changed pipeline content must conflict");
+    assert_eq!(changed.0, StatusCode::CONFLICT);
+    cleanup_pg_trace_tenant(&backend, "tenant-a").await;
+}
+
 #[tokio::test]
 async fn login_resolver_role_cannot_touch_other_tables() {
     let Some(backend) = postgres_backend_for_ingest_test().await else {
@@ -5153,6 +5335,8 @@ fn test_state_with_configured_artifact_store_policies_export_guardrails_and_requ
         tenant_policies: Arc::new(tenant_policies),
         require_tenant_submission_policy,
         db_mirror,
+        pipeline_activation: None,
+        pipeline_service: None,
         pipeline_product: None,
         db_contributor_reads,
         db_reviewer_reads,
@@ -26104,6 +26288,8 @@ async fn maintenance_legal_hold_retention_policy_blocks_expiration_and_purge() {
         tenant_policies: Arc::new(BTreeMap::new()),
         require_tenant_submission_policy: false,
         db_mirror: None,
+        pipeline_activation: None,
+        pipeline_service: None,
         pipeline_product: None,
         db_contributor_reads: false,
         db_reviewer_reads: false,
