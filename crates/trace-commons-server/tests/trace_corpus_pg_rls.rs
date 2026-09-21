@@ -1550,6 +1550,27 @@ fn force_rls_migration_covers_every_trace_rls_table() {
     sql.push_str(include_str!(
         "../../../migrations/V71__reward_participant_access.sql"
     ));
+    sql.push_str(include_str!(
+        "../../../migrations/V74__versioned_pipeline.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V75__versioned_pipeline_durability.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V76__versioned_pipeline_index_credit.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V77__versioned_pipeline_authority_privacy.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V78__versioned_pipeline_product_integration.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V79__versioned_pipeline_qualification.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V80__versioned_pipeline_activation.sql"
+    ));
     // `trace_pii_backstop` carries the same tenant-isolation policy but is not
     // in `TRACE_COMMONS_RLS_TABLES`, so assert it here rather than lose the
     // coverage the hand-maintained table list used to provide.
@@ -1636,6 +1657,27 @@ fn central_rls_tenant_predicate_migration_covers_every_trace_rls_table() {
     assert!(sql.contains("CREATE OR REPLACE FUNCTION trace_current_tenant_id()"));
     sql.push_str(include_str!(
         "../../../migrations/V71__reward_participant_access.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V74__versioned_pipeline.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V75__versioned_pipeline_durability.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V76__versioned_pipeline_index_credit.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V77__versioned_pipeline_authority_privacy.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V78__versioned_pipeline_product_integration.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V79__versioned_pipeline_qualification.sql"
+    ));
+    sql.push_str(include_str!(
+        "../../../migrations/V80__versioned_pipeline_activation.sql"
     ));
     assert!(sql.contains("RETURNS TEXT"));
     assert!(sql.contains("current_setting('trace_commons.trace_tenant_id', true)"));
