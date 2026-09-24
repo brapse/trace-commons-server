@@ -9,6 +9,8 @@ use std::collections::HashSet;
 mod account_onboarding;
 #[path = "postgres_mission_catalog.rs"]
 mod mission_catalog;
+#[cfg(test)]
+mod pipeline_upgrade_tests;
 #[path = "postgres_public_run.rs"]
 mod public_run;
 #[path = "postgres_reward_participant.rs"]
