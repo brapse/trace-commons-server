@@ -61,6 +61,10 @@ fn is_near_account_id(value: &str) -> bool {
             .any(|pair| separator(&pair[0]) && separator(&pair[1]))
 }
 
+/// The NEAR networks that a `nep141` descriptor can name. A fixed set gives
+/// each network one spelling, so one token cannot be pinned under two labels.
+const NEAR_NETWORKS: [&str; 2] = ["mainnet", "testnet"];
+
 /// An EIP-155 chain id in canonical decimal: nonzero, with no leading zero.
 fn is_evm_chain_id(value: &str) -> bool {
     !value.starts_with('0')
@@ -551,8 +555,9 @@ impl InstrumentKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstrumentDescriptor {
     pub kind: InstrumentKind,
-    /// `nep141`: the NEAR network, such as `mainnet`. `erc20`: the EIP-155
-    /// chain id in decimal, such as `1`. `credit_account`: the ledger label.
+    /// `nep141`: the NEAR network, `mainnet` or `testnet`. `erc20`: the
+    /// EIP-155 chain id in decimal, such as `1`. `credit_account`: the ledger
+    /// label.
     pub network: String,
     /// `nep141`: the token's NEAR account id. `erc20`: the lowercase
     /// `0x`-prefixed contract address. `credit_account`: the account label.
@@ -568,7 +573,7 @@ impl InstrumentDescriptor {
     pub fn validate(&self) -> Result<(), ContractError> {
         let located = match self.kind {
             InstrumentKind::Nep141 => {
-                is_safe_identifier(&self.network) && is_near_account_id(&self.contract)
+                NEAR_NETWORKS.contains(&self.network.as_str()) && is_near_account_id(&self.contract)
             }
             InstrumentKind::Erc20 => {
                 is_evm_chain_id(&self.network) && is_evm_address(&self.contract)
@@ -585,6 +590,7 @@ impl InstrumentDescriptor {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "BundleManifestFields")]
 pub struct BundleManifest {
     pub format_version: u32,
     pub admission: PolicyRef,
@@ -593,8 +599,39 @@ pub struct BundleManifest {
     pub settle: PolicyRef,
     /// The instruments that this bundle can award, each pinned to one
     /// descriptor. An award for an instrument that is not here is refused.
-    #[serde(deserialize_with = "unique_instruments")]
     pub instruments: BTreeMap<InstrumentId, InstrumentDescriptor>,
+}
+
+/// Loaded `BundleManifest` fields. Loading applies every check that
+/// `bundle_id` applies, so a reader that uses `instrument` or
+/// `require_pinned` without the bundle identifier still gets only valid
+/// descriptors.
+#[derive(Deserialize)]
+struct BundleManifestFields {
+    format_version: u32,
+    admission: PolicyRef,
+    review: PolicyRef,
+    score: PolicyRef,
+    settle: PolicyRef,
+    #[serde(deserialize_with = "unique_instruments")]
+    instruments: BTreeMap<InstrumentId, InstrumentDescriptor>,
+}
+
+impl TryFrom<BundleManifestFields> for BundleManifest {
+    type Error = ContractError;
+
+    fn try_from(fields: BundleManifestFields) -> Result<Self, Self::Error> {
+        let manifest = Self {
+            format_version: fields.format_version,
+            admission: fields.admission,
+            review: fields.review,
+            score: fields.score,
+            settle: fields.settle,
+            instruments: fields.instruments,
+        };
+        manifest.canonical_bytes()?;
+        Ok(manifest)
+    }
 }
 
 /// Loads the pinned instruments and refuses a repeated instrument. A plain
@@ -661,8 +698,10 @@ impl BundleManifest {
     }
 
     /// Refuses an award set that names an instrument this bundle does not
-    /// pin. A runner applies this to Score's awards before it commits the
-    /// Score outcome, so no settlement starts for an unpinned instrument.
+    /// pin. `ScoreDecision::for_bundle` applies it, so no Score decision is
+    /// built with an unpinned award. A policy chooses the manifest that it
+    /// passes, so a runner also applies this with the run's bound manifest
+    /// before it commits the Score outcome.
     pub fn require_pinned(&self, awards: &InstrumentAwards) -> Result<(), ContractError> {
         if awards
             .iter()
@@ -731,11 +770,15 @@ fn encode_instrument(
     descriptor: &InstrumentDescriptor,
 ) -> Result<(), ContractError> {
     descriptor.validate()?;
-    // `Microcredits` reads a Trace Credit atomic unit as one microcredit.
-    if instrument_id.as_str() == TRACE_CREDIT_INSTRUMENT_ID
-        && descriptor.decimals != TRACE_CREDIT_DECIMALS
-    {
-        return Err(ContractError::TraceCreditDecimals);
+    // Trace Credit is a NEP-141 token, and `Microcredits` reads one of its
+    // atomic units as one microcredit.
+    if instrument_id.as_str() == TRACE_CREDIT_INSTRUMENT_ID {
+        if descriptor.kind != InstrumentKind::Nep141 {
+            return Err(ContractError::TraceCreditKind);
+        }
+        if descriptor.decimals != TRACE_CREDIT_DECIMALS {
+            return Err(ContractError::TraceCreditDecimals);
+        }
     }
     encode_string(output, instrument_id.as_str());
     encode_string(output, descriptor.kind.as_str());
@@ -885,6 +928,8 @@ pub enum ContractError {
     NonCanonicalAtomicUnits,
     #[error("instrument descriptor does not match the form its kind requires")]
     InvalidInstrumentDescriptor,
+    #[error("the trace_credit instrument must pin a NEP-141 token")]
+    TraceCreditKind,
     #[error("the trace_credit instrument must pin six decimals")]
     TraceCreditDecimals,
     #[error("an award names an instrument that the bundle does not pin")]
@@ -926,9 +971,40 @@ pub enum ReviewDecision {
     Rejected { reason: ReasonCode },
 }
 
+/// Score's award set. It has no public field, so a policy builds it only
+/// through `for_bundle`, which refuses an award for an instrument that the
+/// bundle does not pin.
+///
+/// ```compile_fail
+/// use trace_commons_gate_api::pipeline::{InstrumentAwards, ScoreDecision};
+///
+/// let decision = ScoreDecision {
+///     awards: InstrumentAwards::default(),
+/// };
+/// ```
+///
+/// Loading a stored decision does not check pins, because a committed Score
+/// outcome is loaded without its manifest. Its awards were checked when it
+/// was built.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScoreDecision {
-    pub awards: InstrumentAwards,
+    awards: InstrumentAwards,
+}
+
+impl ScoreDecision {
+    /// Builds Score's decision under a bundle. Every award must name an
+    /// instrument that `manifest` pins.
+    pub fn for_bundle(
+        manifest: &BundleManifest,
+        awards: InstrumentAwards,
+    ) -> Result<Self, ContractError> {
+        manifest.require_pinned(&awards)?;
+        Ok(Self { awards })
+    }
+
+    pub fn awards(&self) -> &InstrumentAwards {
+        &self.awards
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3612,7 +3688,7 @@ mod tests {
         // A pinned descriptor is part of the bundle identity.
         let bat = InstrumentId::new("bat").unwrap();
         let changes: [fn(&mut InstrumentDescriptor); 4] = [
-            |descriptor| descriptor.kind = InstrumentKind::Nep141,
+            |descriptor| descriptor.kind = InstrumentKind::CreditAccount,
             |descriptor| descriptor.network = "10".to_string(),
             |descriptor| descriptor.contract = format!("0x{}", "1".repeat(40)),
             |descriptor| descriptor.decimals = 8,
@@ -3677,7 +3753,16 @@ mod tests {
             contract: "inference_credit".to_string(),
             decimals: 0,
         };
-        for valid in [trace_credit_descriptor(), bat_descriptor(), credit_account] {
+        let testnet = InstrumentDescriptor {
+            network: "testnet".to_string(),
+            ..trace_credit_descriptor()
+        };
+        for valid in [
+            trace_credit_descriptor(),
+            testnet,
+            bat_descriptor(),
+            credit_account,
+        ] {
             assert_eq!(valid.validate(), Ok(()), "{valid:?}");
         }
         let implicit = InstrumentDescriptor {
@@ -3691,7 +3776,7 @@ mod tests {
             change(&mut descriptor);
             descriptor.validate()
         };
-        let near: [fn(&mut InstrumentDescriptor); 8] = [
+        let near: [fn(&mut InstrumentDescriptor); 12] = [
             |d| d.contract = "a".to_string(),
             |d| d.contract = "a".repeat(65),
             |d| d.contract = "-credit.near".to_string(),
@@ -3700,6 +3785,10 @@ mod tests {
             |d| d.contract = "Credit.near".to_string(),
             |d| d.contract = "credit near".to_string(),
             |d| d.network = "Mainnet".to_string(),
+            |d| d.network = "near-mainnet".to_string(),
+            |d| d.network = "..".to_string(),
+            |d| d.network = String::new(),
+            |d| d.network = "1".to_string(),
         ];
         for change in near {
             assert_eq!(
@@ -3707,8 +3796,12 @@ mod tests {
                 Err(ContractError::InvalidInstrumentDescriptor)
             );
         }
-        let evm: [fn(&mut InstrumentDescriptor); 7] = [
+        let evm: [fn(&mut InstrumentDescriptor); 11] = [
             |d| d.network = "0".to_string(),
+            |d| d.network = String::new(),
+            |d| d.network = "+1".to_string(),
+            |d| d.network = "1 ".to_string(),
+            |d| d.network = "mainnet".to_string(),
             |d| d.network = "01".to_string(),
             |d| d.network = "eip155:1".to_string(),
             |d| d.network = "18446744073709551616".to_string(),
@@ -3734,8 +3827,9 @@ mod tests {
             Err(ContractError::InvalidInstrumentDescriptor)
         );
 
-        // A manifest refuses a malformed descriptor, and Trace Credit must
-        // pin six decimals so one atomic unit stays one microcredit.
+        // A manifest refuses a malformed descriptor. Trace Credit must pin a
+        // NEP-141 token with six decimals, so one atomic unit stays one
+        // microcredit.
         let mut manifest = golden_manifest();
         manifest
             .instruments
@@ -3756,6 +3850,26 @@ mod tests {
             manifest.bundle_id(),
             Err(ContractError::TraceCreditDecimals)
         );
+        let other_kinds = [
+            InstrumentDescriptor {
+                decimals: TRACE_CREDIT_DECIMALS,
+                ..bat_descriptor()
+            },
+            InstrumentDescriptor {
+                kind: InstrumentKind::CreditAccount,
+                network: "trace_commons".to_string(),
+                contract: "trace_credit".to_string(),
+                decimals: TRACE_CREDIT_DECIMALS,
+            },
+        ];
+        for descriptor in other_kinds {
+            assert_eq!(descriptor.validate(), Ok(()), "{descriptor:?}");
+            let mut manifest = golden_manifest();
+            manifest
+                .instruments
+                .insert(InstrumentId::trace_credit(), descriptor);
+            assert_eq!(manifest.bundle_id(), Err(ContractError::TraceCreditKind));
+        }
     }
 
     #[test]
@@ -3805,6 +3919,68 @@ mod tests {
     }
 
     #[test]
+    fn manifest_loading_repeats_the_bundle_identity_checks() {
+        use serde_json::{Value, from_value, json, to_value};
+
+        let stored = to_value(golden_manifest()).unwrap();
+        assert_eq!(
+            from_value::<BundleManifest>(stored.clone()).unwrap(),
+            golden_manifest()
+        );
+
+        let refused: [(fn(&mut Value), ContractError); 7] = [
+            (
+                |manifest| {
+                    manifest["instruments"]["trace_credit"] = json!({
+                        "kind": "erc20",
+                        "network": "0",
+                        "contract": "NOPE",
+                        "decimals": 200,
+                    })
+                },
+                ContractError::InvalidInstrumentDescriptor,
+            ),
+            (
+                |manifest| manifest["instruments"]["bat"]["network"] = json!("0"),
+                ContractError::InvalidInstrumentDescriptor,
+            ),
+            (
+                |manifest| {
+                    manifest["instruments"]["trace_credit"] = json!({
+                        "kind": "erc20",
+                        "network": "1",
+                        "contract": "0x0d8775f648430679a709e98d2b0cb6250d2887ef",
+                        "decimals": 6,
+                    })
+                },
+                ContractError::TraceCreditKind,
+            ),
+            (
+                |manifest| manifest["instruments"]["trace_credit"]["decimals"] = json!(18),
+                ContractError::TraceCreditDecimals,
+            ),
+            (
+                |manifest| manifest["format_version"] = json!(2),
+                ContractError::UnsupportedManifestVersion,
+            ),
+            (
+                |manifest| manifest["score"]["policy_id"] = json!(""),
+                ContractError::MissingPolicyIdentity,
+            ),
+            (
+                |manifest| manifest["score"]["projection_ids"] = json!(["p", "p"]),
+                ContractError::DuplicatePolicyListEntry,
+            ),
+        ];
+        for (change, expected) in refused {
+            let mut manifest = stored.clone();
+            change(&mut manifest);
+            let error = from_value::<BundleManifest>(manifest).unwrap_err();
+            assert_eq!(error.to_string(), expected.to_string());
+        }
+    }
+
+    #[test]
     fn awards_for_unpinned_instruments_are_refused() {
         let manifest = golden_manifest();
         assert_eq!(
@@ -3828,10 +4004,40 @@ mod tests {
             vec![award("storage_rebate", 7)],
             vec![award("trace_credit", 3), award("storage_rebate", 7)],
         ] {
+            let unpinned = InstrumentAwards::new(unpinned).unwrap();
             assert_eq!(
-                manifest.require_pinned(&InstrumentAwards::new(unpinned).unwrap()),
+                manifest.require_pinned(&unpinned),
+                Err(ContractError::UnpinnedInstrument)
+            );
+            // A Score decision is built only under a manifest, so an unpinned
+            // award never reaches Settle.
+            assert_eq!(
+                ScoreDecision::for_bundle(&manifest, unpinned),
                 Err(ContractError::UnpinnedInstrument)
             );
         }
+
+        let decision = ScoreDecision::for_bundle(&manifest, pinned.clone()).unwrap();
+        assert_eq!(decision.awards(), &pinned);
+        assert!(
+            ScoreDecision::for_bundle(&manifest, InstrumentAwards::default())
+                .unwrap()
+                .awards()
+                .is_empty()
+        );
+
+        // A committed decision loads without its manifest.
+        let stored = serde_json::to_value(&decision).unwrap();
+        assert_eq!(
+            stored,
+            serde_json::json!({"awards": [
+                {"instrument_id": "bat", "atomic_units": "1000000000000000000"},
+                {"instrument_id": "trace_credit", "atomic_units": "3"},
+            ]})
+        );
+        assert_eq!(
+            serde_json::from_value::<ScoreDecision>(stored).unwrap(),
+            decision
+        );
     }
 }

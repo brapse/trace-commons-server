@@ -437,14 +437,18 @@ stores no object.
 - The manifest MUST pin one instrument descriptor for each instrument that
   the bundle can award. A descriptor has a `kind` (`nep141`, `erc20`, or
   `credit_account`), a network, a contract, and `decimals`.
-- Each descriptor MUST have one spelling: a NEAR account id for `nep141`, a
-  decimal EIP-155 chain id and a lowercase `0x` address for `erc20`, and safe
-  labels for `credit_account`. `decimals` MUST NOT exceed 38.
-- The `trace_credit` descriptor MUST pin 6 decimals, so one atomic unit is one
-  microcredit.
-- An instrument identifier MUST keep one descriptor. A change of kind,
-  network, contract, or `decimals` MUST use a new instrument identifier.
+- Each descriptor MUST have one spelling: `mainnet` or `testnet` and a NEAR
+  account id for `nep141`, a canonical decimal EIP-155 chain id and a
+  lowercase `0x` address for `erc20`, and safe labels for `credit_account`.
+  `decimals` MUST NOT exceed 38.
+- The `trace_credit` descriptor MUST pin a `nep141` token with 6 decimals, so
+  one atomic unit is one microcredit.
+- An instrument identifier MUST keep one descriptor in a tenant (BND-005). A
+  change of kind, network, contract, or `decimals` MUST use a new instrument
+  identifier.
 - A manifest that repeats an instrument MUST fail to load.
+- Loading a manifest MUST apply every check that the bundle identifier
+  applies. A manifest with a malformed descriptor MUST fail to load.
 - The bundle identifier MUST be the canonical hash of the manifest, including
   the pinned descriptors.
 - The bundle hash MUST exclude mutable external state.
@@ -453,7 +457,8 @@ stores no object.
 **Acceptance:** Use golden manifests. Change each identity input separately.
 Change the format version and each policy identifier. Change each descriptor
 field. Confirm the expected bundle identifiers. Load a manifest that repeats
-an instrument key, and a manifest with no instruments. Both must fail.
+an instrument key, a manifest with no instruments, and a manifest with a
+malformed descriptor. Each must fail.
 
 ### BND-002: Package integrity
 
@@ -493,6 +498,25 @@ the resolved bundle.
 
 **Acceptance:** Run phase and bundle tests with small test implementations
 through the production traits.
+
+### BND-005: Instrument descriptor immutability
+
+- In a tenant, an instrument identifier MUST keep one descriptor.
+- The tenant's bundle registry MUST refuse a package that pins an instrument
+  identifier, already registered by that tenant, to a different descriptor.
+  The refusal MUST use the safe label `bundle_instrument_conflict`.
+- The registry MUST accept a package that pins a registered instrument
+  identifier to an equal descriptor.
+- The registry MUST serialize this check with a concurrent registration for
+  the same tenant.
+- The rule MUST be per tenant. There is no cross-tenant instrument registry.
+  One tenant's registrations MUST NOT constrain another tenant.
+
+**Acceptance:** Register a package for a tenant. Register a second package that
+pins the same instrument to an equal descriptor. It must be accepted. Register
+a third package that pins the same instrument to a different descriptor. It
+must be refused with `bundle_instrument_conflict`. The runtime delivery
+provides this PostgreSQL test.
 
 ## 8. Review contracts
 
@@ -595,6 +619,9 @@ and shadow comparison. No active index mutation can occur.
 - Each award MUST name an instrument that the bound bundle pins. The runner
   MUST refuse an award for an unpinned instrument before the Score outcome
   commits.
+- A Score decision MUST be built only through a constructor that takes the
+  bundle manifest and refuses an award for an unpinned instrument. A stored
+  Score decision MUST load without a manifest.
 - An empty collection MUST remain distinct from an incomplete Score phase.
 - Trace Credit MUST use the `trace_credit` instrument.
 - One Trace Credit MUST equal 1,000,000 microcredits.
@@ -605,6 +632,8 @@ and shadow comparison. No active index mutation can occur.
 deterministic ordering, duplicate identifiers, maximum values, overflow,
 negative source input, and excess-precision Trace Credit conversion. Load
 amounts above `u64::MAX`, and refuse a signed, zero-padded, or numeric amount.
+Build a Score decision with an award for an unpinned instrument. It must be
+refused.
 
 ### SCR-004: Score persistence and instrument operations
 
@@ -725,8 +754,9 @@ submission and confirmation around injected crashes.
 - `pipeline_run_settlements` MUST record each instrument operation's progress,
   lease, and retry state, one row for each positive Score award.
 - `pipeline_run_settlements.atomic_units` MUST be `NUMERIC(39,0)` with
-  `CHECK (atomic_units > 0)`. A database check MUST hold `trace_credit` rows
-  to `i64::MAX`.
+  `CHECK (atomic_units > 0)`. A database check MUST hold every row to
+  `u128::MAX`, and another database check MUST hold `trace_credit` rows to
+  `i64::MAX`.
 - Immutable phase history MUST remain in `phase_outcomes`.
 - A terminal infrastructure error MUST NOT create a phase outcome.
 

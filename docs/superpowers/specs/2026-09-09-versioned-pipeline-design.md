@@ -96,7 +96,7 @@ enum ReviewDecision {
 }
 
 struct ScoreDecision {
-    awards: InstrumentAwards,
+    awards: InstrumentAwards, // built only by ScoreDecision::for_bundle
 }
 
 struct InstrumentAward {
@@ -279,26 +279,51 @@ scale. The descriptor gives:
 - `kind`: `nep141` for a NEAR token, `erc20` for an EVM token, or
   `credit_account` for an off-chain credit account that is not a token.
   Inference credits can use `credit_account`.
-- `network` and `contract`: a NEAR network and account id, an EIP-155 chain id
-  and lowercase `0x` contract address, or a ledger label and account label.
+- `network` and `contract`: a NEAR network (`mainnet` or `testnet`) and
+  account id, an EIP-155 chain id in canonical decimal and a lowercase `0x`
+  contract address, or a ledger label and account label.
 - `decimals`: the scale of the atomic units, at most 38.
 
 Each kind accepts one spelling of its network and contract, so equal
 descriptors give equal bundle identifiers. The descriptors are part of the
 canonical manifest bytes, so they are part of the bundle identifier.
 
-The `trace_credit` descriptor must pin 6 decimals. A manifest that repeats an
-instrument, or that has no `instruments` field, fails to load.
+The `trace_credit` descriptor must pin a `nep141` token with 6 decimals. A
+manifest that repeats an instrument, or that has no `instruments` field, fails
+to load. Loading a manifest applies every check that the bundle identifier
+applies, so a manifest with a malformed descriptor also fails to load. A
+reader that uses a loaded manifest's descriptors without its bundle identifier
+gets only valid descriptors.
 
-An award for an instrument that the bound bundle does not pin is refused. The
-runner checks Score's awards with `BundleManifest::require_pinned` before the
-Score outcome commits, so no settlement starts for an unpinned instrument.
+An award for an instrument that the bound bundle does not pin is refused.
+`ScoreDecision` has no public field. A Score policy builds it with
+`ScoreDecision::for_bundle(&manifest, awards)`, which refuses an award for an
+instrument that the manifest does not pin, and `SettleDecision::new` takes
+only a `ScoreDecision`. A stored decision loads without a manifest, because a
+committed Score outcome was checked when it was built. A policy chooses the
+manifest that it passes, so the runner also checks Score's awards against the
+run's bound manifest with `BundleManifest::require_pinned` before the Score
+outcome commits. No settlement starts for an unpinned instrument.
 
-A descriptor never changes for an instrument identifier. A change of
-contract, network, kind, or `decimals` is a new instrument with a new
-identifier. An award that is already signed never gets a new meaning. The
-bundle registry enforces this rule: it refuses a package that pins a
-registered instrument identifier to a different descriptor.
+A descriptor never changes for an instrument identifier in a tenant. A change
+of contract, network, kind, or `decimals` is a new instrument with a new
+identifier. An award that is already signed never gets a new meaning.
+
+This rule is per tenant. The tenant's bundle registry refuses a package that
+pins an instrument identifier, already registered by that tenant, to a
+different descriptor. Registering an equal descriptor again is allowed. There
+is no cross-tenant instrument registry. Forced RLS isolates the tenants, and
+each tenant's awards resolve through the descriptors that the tenant
+registered. Two tenants can pin one instrument identifier to different
+descriptors.
+
+One manifest cannot express this rule, because the rule compares a package
+with the tenant's registered packages. The check reads server storage, so the
+runtime delivery enforces it: `PgPipelineStore::register_bundle` refuses the
+package with the safe label `bundle_instrument_conflict`. The PostgreSQL test
+`register_bundle_refuses_a_changed_descriptor_for_a_registered_instrument` in
+`crates/trace-commons-server/tests/versioned_pipeline_runtime_pg.rs` covers
+it. Contract BND-005 states the rule.
 
 ## 4. Workflow
 
@@ -565,16 +590,16 @@ Tests use small policy implementations through the production trait:
 
 ```rust
 struct FixedScorePolicy {
-    awards: InstrumentAwards,
+    // Built once, when the bundle loads, with
+    // `ScoreDecision::for_bundle(&manifest, awards)`.
+    decision: ScoreDecision,
 }
 
 #[async_trait]
 impl ScorePolicy for FixedScorePolicy {
     async fn execute(&self, _input: &ScoreInput) -> Result<ScoreOutput, PolicyError> {
         let result = PhaseResult {
-            decision: ScoreDecision {
-                awards: self.awards.clone(),
-            },
+            decision: self.decision.clone(),
             evidence: ScoreEvidence::Fixed,
             evaluation: ScoreEvaluation::FixedAmount,
         };
@@ -611,6 +636,7 @@ pipeline_runs
 pipeline_run_settlements
   tenant_id, run_id, instrument_id
   atomic_units NUMERIC(39,0) CHECK (atomic_units > 0)
+  CHECK (atomic_units <= 340282366920938463463374607431768211455)
   CHECK (instrument_id <> 'trace_credit'
          OR atomic_units <= 9223372036854775807)
   operation_ref_hash, result_ref_hash nullable
@@ -645,11 +671,14 @@ first; both count as complete for the Settle outcome.
 `atomic_units` is `NUMERIC(39,0)`. Its 39 digits hold every `u128` value.
 `BIGINT` is signed 64-bit and would refuse any token amount above `i64::MAX`.
 The positivity check matches the rule that only a positive award creates a
-row. A reader loads the value through `AtomicUnits`, which refuses a value
-above `u128::MAX`. The second check
-holds `trace_credit` rows to `i64::MAX` (9223372036854775807), the range of
-the `BIGINT` credit ledger. The database enforces the ledger bound, and not
-only the Rust contract.
+row. `NUMERIC(39,0)` also holds values up to 10^39 - 1, above `u128::MAX`. A
+reader loads the value through `AtomicUnits`, which refuses a value above
+`u128::MAX`, so the second check holds every row to `u128::MAX`
+(340282366920938463463374607431768211455). The database then refuses a value
+above `u128::MAX` when it is written. Without the check, the row would be
+stored and its settlement leg could not be read. The third check holds `trace_credit` rows to
+`i64::MAX` (9223372036854775807), the range of the `BIGINT` credit ledger. The
+database enforces both bounds, and not only the Rust contract.
 
 Existing credit events, holds, batches, and outbox rows stay the Trace Credit
 and payout records. A `trace_credit` settlement row links its credit event
