@@ -19,6 +19,10 @@ pub mod postgres;
 mod trace_corpus_common;
 mod trace_corpus_pg;
 
+pub(crate) use trace_corpus_pg::{
+    insert_credit_settlement_batch_on_tx, list_trace_credit_holds_on_tx,
+};
+
 pub use postgres::InviteRedemption;
 
 /// Insert payload for an invite grant. Mirrors `InviteEntry` minus

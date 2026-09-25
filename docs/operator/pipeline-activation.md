@@ -25,6 +25,33 @@ The pipeline now has these properties:
 - Legacy writers disable only after their pending owned work completes.
 - Destructive schema cleanup is not part of this phase.
 
+## Pipeline receipt routing before activation
+
+`TRACE_COMMONS_PIPELINE_RECEIPTS_TENANT_IDS` lists the tenants whose new
+receipts go to the pipeline. It has an effect only when the ingest build
+injects a pipeline runtime. The repository binary injects none.
+
+- Unset or empty (the default): every receipt takes the legacy path.
+- Tenants listed with a runtime: those tenants' receipts go to the pipeline.
+- Tenants listed without a runtime: ingest refuses to start with
+  `pipeline_receipts_configured_without_runtime`.
+- Removing a tenant from the list also stops the worker for that tenant.
+  Its in-flight pipeline runs stay unprocessed until the tenant is listed
+  again.
+
+Activation replaces this list with qualified routing.
+
+## Submission quota at switch-over
+
+The pipeline counts only pipeline receipts against the hourly submission
+quota. It does not count legacy submission records. In the first hour after a
+tenant moves to the pipeline, that tenant can therefore receive up to one
+extra hourly quota. This is accepted behavior.
+
+The legacy quota and tombstone checks still run before ingest routes a
+receipt to the pipeline. A tenant with recent legacy submissions can
+therefore receive a legacy 429 for a pipeline receipt.
+
 ## Rehearse the switch
 
 Set `TRACE_COMMONS_PG_TEST_DATABASE_URL` to a PostgreSQL test database.

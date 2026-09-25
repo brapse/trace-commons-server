@@ -5153,6 +5153,9 @@ fn test_state_with_configured_artifact_store_policies_export_guardrails_and_requ
         tenant_policies: Arc::new(tenant_policies),
         require_tenant_submission_policy,
         db_mirror,
+        pipeline_service: None,
+        pipeline_runtime_required: false,
+        pipeline_worker_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         db_contributor_reads,
         db_reviewer_reads,
         db_reviewer_require_object_refs: false,
@@ -9283,6 +9286,383 @@ fn tenant_rollout_gate_dependency_requires_matching_tenant_scope() {
     )
     .expect_err("missing tenant-scoped dependency is rejected");
     assert!(missing.to_string().contains("missing dependency"));
+}
+
+#[test]
+fn required_ingest_pipeline_runtime_fails_closed_without_assembly() {
+    let error = assemble_ingest_pipeline_runtime(None, None, None, true)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "pipeline_runtime_required_but_not_injected"
+    );
+}
+
+#[test]
+fn pipeline_receipt_tenants_require_an_injected_runtime() {
+    let gates = TraceTenantRolloutGates::for_feature(
+        TraceTenantRolloutFeature::PipelineReceipts,
+        &["tenant-a"],
+    );
+    let error = validate_pipeline_receipt_rollout(&gates, false)
+        .err()
+        .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "pipeline_receipts_configured_without_runtime"
+    );
+    assert!(validate_pipeline_receipt_rollout(&gates, true).is_ok());
+    assert!(validate_pipeline_receipt_rollout(&TraceTenantRolloutGates::default(), false).is_ok());
+}
+
+#[test]
+fn ingest_and_pipeline_derive_the_same_tenant_storage_ref() {
+    for tenant in ["tenant-a", "tenant-b", "a much longer tenant identifier"] {
+        assert_eq!(
+            tenant_storage_ref(tenant),
+            trace_commons_server::versioned_pipeline::pipeline_tenant_storage_ref(tenant).as_str()
+        );
+    }
+}
+
+#[tokio::test]
+async fn pipeline_readiness_reports_a_label_when_the_worker_is_not_ready() {
+    use super::pipeline_runtime::build_pipeline_app;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state_with_options(
+        dir.path().to_path_buf(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+    );
+    let response = build_pipeline_app(state)
+        .oneshot(
+            axum::http::Request::get("/v1/pipeline/readiness")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"status": "not_ready", "reason": "pipeline_runtime_absent"})
+    );
+}
+
+/// A PostgreSQL backend that points at a loopback port nothing listens on.
+/// `PgBackend::new` builds the pool lazily, so constructing it needs no
+/// database; any query through it fails at once.
+async fn pg_backend_without_a_database() -> Arc<PgBackend> {
+    let unused_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    Arc::new(
+        PgBackend::new(&DatabaseConfig::from_postgres_url(
+            &format!("postgres://nobody@127.0.0.1:{unused_port}/none"),
+            1,
+        ))
+        .await
+        .unwrap(),
+    )
+}
+
+/// A minimal pipeline service over `backend` and `artifact_store`, recording
+/// `object_store_name` when one is given (else the builder's default).
+fn minimal_pipeline_service(
+    backend: Arc<PgBackend>,
+    artifact_store: Arc<dyn TraceArtifactStore>,
+    object_store_name: Option<String>,
+) -> anyhow::Result<Arc<PipelineService>> {
+    use trace_commons_gate_api::{ReferenceEmbedder, ReferencePerplexityScorer};
+    use trace_commons_server::versioned_pipeline::{PipelineCaps, PipelineServiceBuilder};
+    use trace_commons_server::versioned_pipeline_bundle::{
+        MinimalPolicyBundle, PipelineBundleConfig,
+    };
+    use trace_commons_server::versioned_pipeline_credit::SettlementAdapterRegistry;
+    use trace_commons_server::versioned_pipeline_index::IsolatedPipelineIndex;
+
+    let scorer = Arc::new(ReferencePerplexityScorer::new());
+    let embedder = Arc::new(ReferenceEmbedder::new());
+    let package = MinimalPolicyBundle::minimal_package(
+        &PipelineBundleConfig {
+            instrument_awards: vec![],
+            include_index: false,
+            variant: None,
+        },
+        scorer.as_ref(),
+        embedder.as_ref(),
+    )?;
+    let index = IsolatedPipelineIndex::new();
+    let mut builder = PipelineServiceBuilder::new(
+        backend,
+        artifact_store,
+        package,
+        index.clone(),
+        index,
+        SettlementAdapterRegistry::new(Vec::new())?,
+        PipelineCaps {
+            per_instrument_atomic_units: BTreeMap::new(),
+        },
+    )
+    .with_scorer(scorer)
+    .with_embedder(embedder);
+    if let Some(object_store_name) = object_store_name {
+        builder = builder.with_object_store_name(object_store_name);
+    }
+    Ok(Arc::new(builder.build()?))
+}
+
+/// M11: ingest's assembly hands the configured store's name to the
+/// assembler and refuses a service that records any other label on its
+/// object refs.
+#[tokio::test]
+async fn pipeline_assembly_requires_the_configured_object_store_name() {
+    struct NameAssembler {
+        pass_the_name: bool,
+    }
+    impl IngestPipelineRuntimeAssembler for NameAssembler {
+        fn assemble(
+            &self,
+            context: pipeline_runtime::IngestPipelineRuntimeContext,
+        ) -> anyhow::Result<Arc<PipelineService>> {
+            minimal_pipeline_service(
+                context.backend,
+                context.artifact_store,
+                self.pass_the_name.then_some(context.object_store_name),
+            )
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = pg_backend_without_a_database().await;
+    let connections = TraceCorpusDbConnections {
+        database: backend.clone() as Arc<dyn Database>,
+        postgres: backend,
+    };
+    let configured_store = ConfiguredTraceArtifactStore::legacy(test_artifact_store(dir.path()));
+
+    let refused = assemble_ingest_pipeline_runtime(
+        Some(&NameAssembler {
+            pass_the_name: false,
+        }),
+        Some(&connections),
+        Some(&configured_store),
+        false,
+    )
+    .err()
+    .expect("a service that ignores the configured store name is refused");
+    assert_eq!(
+        refused.to_string(),
+        "pipeline_runtime_object_store_mismatch"
+    );
+
+    let service = assemble_ingest_pipeline_runtime(
+        Some(&NameAssembler {
+            pass_the_name: true,
+        }),
+        Some(&connections),
+        Some(&configured_store),
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        service.object_store_name(),
+        TRACE_COMMONS_LEGACY_ENCRYPTED_OBJECT_STORE
+    );
+}
+
+/// A pipeline service whose PostgreSQL backend points at a loopback port
+/// nothing listens on: its readiness probe fails at once.
+async fn pipeline_service_without_a_database() -> Arc<PipelineService> {
+    let dir = tempfile::tempdir().unwrap();
+    minimal_pipeline_service(
+        pg_backend_without_a_database().await,
+        test_artifact_store(dir.path()),
+        None,
+    )
+    .unwrap()
+}
+
+/// M12: a worker whose readiness probe fails reports
+/// `pipeline_worker_not_ready`, even when an earlier pass had reported
+/// ready.
+#[tokio::test]
+async fn pipeline_readiness_reports_not_ready_when_the_worker_probe_fails() {
+    use super::pipeline_runtime::{build_pipeline_app, run_pipeline_worker_pass};
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut state = test_state_with_options(
+        dir.path().to_path_buf(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+    );
+    let service = pipeline_service_without_a_database().await;
+    Arc::make_mut(&mut state).pipeline_service = Some(service.clone());
+    state
+        .pipeline_worker_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    run_pipeline_worker_pass(
+        async move { service.readiness().await },
+        Vec::<String>::new(),
+        |_tenant_id| async {},
+        &state.pipeline_worker_ready,
+        &stop_rx,
+    )
+    .await;
+    assert!(
+        !state
+            .pipeline_worker_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    let response = build_pipeline_app(state)
+        .oneshot(
+            axum::http::Request::get("/v1/pipeline/readiness")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"status": "not_ready", "reason": "pipeline_worker_not_ready"})
+    );
+}
+
+/// I5: a panic while one tenant's batch runs ends only that batch. The pass
+/// goes on to the next tenant, the worker reports not ready for that pass,
+/// and a later pass without a panic reports ready again.
+#[tokio::test]
+async fn a_panicking_tenant_batch_marks_the_worker_not_ready_and_the_pass_continues() {
+    use super::pipeline_runtime::run_pipeline_worker_pass;
+
+    let ready = std::sync::atomic::AtomicBool::new(true);
+    let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let drained = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let drain = |panicking: Option<&'static str>| {
+        let drained = drained.clone();
+        move |tenant_id: String| {
+            let drained = drained.clone();
+            async move {
+                if panicking == Some(tenant_id.as_str()) {
+                    panic!("test-only panic in a tenant batch");
+                }
+                drained.lock().unwrap().push(tenant_id);
+            }
+        }
+    };
+
+    run_pipeline_worker_pass(
+        async { Ok(()) },
+        vec!["tenant-a".to_string(), "tenant-b".to_string()],
+        drain(Some("tenant-a")),
+        &ready,
+        &stop_rx,
+    )
+    .await;
+    assert!(
+        !ready.load(std::sync::atomic::Ordering::Relaxed),
+        "a pass with a panicking batch reports not ready"
+    );
+    assert_eq!(
+        *drained.lock().unwrap(),
+        vec!["tenant-b".to_string()],
+        "the pass continued past the panicking tenant"
+    );
+
+    run_pipeline_worker_pass(
+        async { Ok(()) },
+        vec!["tenant-a".to_string(), "tenant-b".to_string()],
+        drain(None),
+        &ready,
+        &stop_rx,
+    )
+    .await;
+    assert!(
+        ready.load(std::sync::atomic::Ordering::Relaxed),
+        "a later clean pass reports ready again"
+    );
+}
+
+#[tokio::test]
+async fn source_stays_public_on_the_pipeline_app() {
+    use super::pipeline_runtime::build_pipeline_app;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state_with_options(
+        dir.path().to_path_buf(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+    );
+    let response = build_pipeline_app(state)
+        .oneshot(
+            axum::http::Request::get("/v1/source")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn run_pipeline_app_stops_within_the_grace_period() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = test_state_with_options(
+        dir.path().to_path_buf(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        false,
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(run_pipeline_app(state, listener, async {
+        let _ = rx.await;
+    }));
+    tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), server)
+        .await
+        .expect("bounded shutdown")
+        .unwrap()
+        .unwrap();
 }
 
 #[test]
@@ -26283,6 +26663,9 @@ async fn maintenance_legal_hold_retention_policy_blocks_expiration_and_purge() {
         tenant_policies: Arc::new(BTreeMap::new()),
         require_tenant_submission_policy: false,
         db_mirror: None,
+        pipeline_service: None,
+        pipeline_runtime_required: false,
+        pipeline_worker_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         db_contributor_reads: false,
         db_reviewer_reads: false,
         db_reviewer_require_object_refs: false,
@@ -93918,6 +94301,15 @@ mod admission_pg_tests;
 /// is the failure mode that step exists to prevent.
 #[path = "nearai_ceremony_pg_tests.rs"]
 mod nearai_ceremony_pg_tests;
+
+/// Spec section 3D acceptance: a receipt through the real HTTP router, auth,
+/// and worker, surviving a crash and restart. Nested here (not declared
+/// directly in `trace-commons-ingest.rs`) for the same reason as
+/// `admission_pg_tests` and `nearai_ceremony_pg_tests` above: it reuses this
+/// module's private test-state and fixture helpers, which are visible only
+/// to `tests`'s descendants.
+#[path = "pipeline_http_pg_tests.rs"]
+mod pipeline_http_pg_tests;
 
 /// The nineteen `validate_*_reason` / `validate_*_purpose` wrappers all reduce
 /// to this, so the trim / reject-empty / reject-over-1024 contract and the two
